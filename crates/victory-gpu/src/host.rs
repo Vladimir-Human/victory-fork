@@ -516,6 +516,19 @@ fn reaper() {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn flush_reaper_for_test() {
+    struct SyncDrop(std::sync::mpsc::SyncSender<()>);
+    impl Drop for SyncDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    reap(vec![Retired(Box::new(SyncDrop(tx)))]);
+    let _ = rx.recv();
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
