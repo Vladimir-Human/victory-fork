@@ -1370,7 +1370,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         && !room_raw()
     {
         let want = footprint(&r.desc).map_or(16 << 20, |f| f.size.max(4 << 20));
-        let _ = evict_lru_textures(want);
+        let outcome = evict_lru_textures(want);
+        if outcome.evicted_bytes < want {
+            PENDING_WANT_BYTES.fetch_max(want, std::sync::atomic::Ordering::Release);
+        }
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
     if made.is_none() {
@@ -1465,6 +1468,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             drop(made);
             let want = footprint(&r.desc).map_or(64 << 20, |f| f.size.max(16 << 20));
             let evicted = evict_lru_textures(want);
+            if evicted.evicted_bytes < want {
+                PENDING_WANT_BYTES.fetch_max(want, std::sync::atomic::Ordering::Release);
+            }
             made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(existing) = made.clone() {
                 let now = crate::host::moment();
@@ -1604,6 +1610,10 @@ static TEST_LRU_HEAP_EVICT: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(u8::MAX);
 
 #[cfg(all(windows, test))]
+static TEST_LRU_HEAP_IDLE_FRAMES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+#[cfg(all(windows, test))]
 static TEST_EVICT_MIN_IDLE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -1653,6 +1663,7 @@ pub(crate) fn room() -> bool {
     }
     let outcome = evict_lru_textures(32 << 20);
     if outcome.evicted_bytes == 0 {
+        PENDING_WANT_BYTES.fetch_max(32 << 20, std::sync::atomic::Ordering::Release);
         LAST_DRY.store(stamp, Relaxed);
         return false;
     }
@@ -2216,6 +2227,9 @@ pub(crate) static MIP_CLAMP_STATS: [std::sync::atomic::AtomicU64; 4] =
 static NEED_HEAP_EVICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
+static PENDING_WANT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
 static HAS_UNCLAMPED_REBINDS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -2316,10 +2330,40 @@ fn lru_heap_evict_enabled() -> bool {
 }
 
 #[cfg(windows)]
+fn parse_lru_heap_idle_frames(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(120)
+}
+
+/// Minimum frames a `HostHeap` slot must sit untouched (`last_used_frame`)
+/// before opt-in `VICTORY_TEXTURE_LRU_HEAP_EVICT=1` may unmake it
+/// (`VICTORY_TEXTURE_LRU_HEAP_IDLE_FRAMES`, default `120`).
+#[cfg(windows)]
+fn lru_heap_idle_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let env_frames = *FRAMES.get_or_init(|| {
+        parse_lru_heap_idle_frames(
+            std::env::var("VICTORY_TEXTURE_LRU_HEAP_IDLE_FRAMES")
+                .ok()
+                .as_deref(),
+        )
+    });
+    #[cfg(test)]
+    {
+        let override_frames =
+            TEST_LRU_HEAP_IDLE_FRAMES.load(std::sync::atomic::Ordering::Acquire);
+        if override_frames != u64::MAX {
+            return override_frames;
+        }
+    }
+    env_frames
+}
+
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EvictPolicy {
     pub(crate) min_idle_ms: u64,
     pub(crate) min_idle_frames: u64,
+    pub(crate) heap_idle_frames: u64,
     pub(crate) slot_cooldown_frames: u64,
     pub(crate) max_victims: usize,
     pub(crate) allow_heap_unmake: bool,
@@ -2331,7 +2375,8 @@ impl Default for EvictPolicy {
         Self {
             min_idle_ms: 1_000,
             min_idle_frames: 2,
-            slot_cooldown_frames: 240,
+            heap_idle_frames: lru_heap_idle_frames(),
+            slot_cooldown_frames: 30,
             max_victims: 256,
             // Off by default so bindless textures held in shader-visible
             // `HostHeap` slots (`references > 1`) are never unmade; only
@@ -2368,18 +2413,25 @@ fn pressured_min_idle_ms() -> u64 {
 #[cfg(windows)]
 pub(crate) fn evict_if_pressured() {
     flush_unclamped_rebinds();
+    let want = PENDING_WANT_BYTES.swap(0, std::sync::atomic::Ordering::AcqRel);
+    let pressured = !room_raw() || want > 0;
+    if pressured {
+        // Tier 2 (default ON): yield superseded `keep_views()` slots so dead
+        // older copies drop to `references == 1` before LRU reaping runs.
+        let _ = crate::descriptor::host::yield_kept_views();
+    }
     if !lru_evict_enabled() {
         return;
     }
     let heap_evict = lru_heap_evict_enabled();
     let deferred =
         heap_evict && NEED_HEAP_EVICT.swap(false, std::sync::atomic::Ordering::AcqRel);
-    if deferred || !room_raw() {
+    if deferred || pressured {
         let Some(host) = crate::host::host() else {
             return;
         };
         let _ = evict_lru_textures_with(
-            64 << 20,
+            want.max(64 << 20),
             host.completed_fence(),
             host.last_signalled_fence(),
             crate::host::submissions_in_flight(),
@@ -2437,6 +2489,8 @@ pub(crate) fn evict_lru_textures_with(
         && in_flight_submissions == 0
         && completed_fence >= last_signalled_fence;
     let now_frame = crate::frame::current();
+    let heap_recency = can_unmake_heaps
+        .then(|| crate::descriptor::heap_resource_recency(now_frame, policy.heap_idle_frames));
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut skipped_in_flight = 0u64;
     let mut blocked_on_heaps = false;
@@ -2486,14 +2540,22 @@ pub(crate) fn evict_lru_textures_with(
                     needs_heap_unmake: false,
                 });
             } else if can_unmake_heaps {
-                candidates.push(Candidate {
-                    at,
-                    raw,
-                    last_frame,
-                    used_moment: used,
-                    bytes,
-                    needs_heap_unmake: true,
-                });
+                if let Some(rec) = heap_recency.as_ref().and_then(|m| m.get(&raw))
+                    && !rec.protected
+                    && refs <= 1u32.saturating_add(rec.kept_refs)
+                {
+                    let effective_last_frame = last_frame.max(rec.max_last_used_frame);
+                    if now_frame.saturating_sub(effective_last_frame) >= policy.heap_idle_frames {
+                        candidates.push(Candidate {
+                            at,
+                            raw,
+                            last_frame: effective_last_frame,
+                            used_moment: used,
+                            bytes,
+                            needs_heap_unmake: true,
+                        });
+                    }
+                }
             } else {
                 blocked_on_heaps = true;
             }
@@ -2514,25 +2576,21 @@ pub(crate) fn evict_lru_textures_with(
     }
 
     candidates.sort_unstable_by(|a, b| {
-        a.last_frame
-            .cmp(&b.last_frame)
+        a.needs_heap_unmake
+            .cmp(&b.needs_heap_unmake)
+            .then_with(|| a.last_frame.cmp(&b.last_frame))
             .then_with(|| (a.used_moment & 0xffff_ffff).cmp(&(b.used_moment & 0xffff_ffff)))
-            .then_with(|| a.needs_heap_unmake.cmp(&b.needs_heap_unmake))
             .then_with(|| b.bytes.cmp(&a.bytes))
     });
 
-    let cushion = target_bytes.saturating_add(target_bytes >> 2);
     let mut selected: Vec<Candidate> = Vec::new();
     let mut planned = 0u64;
     for c in candidates {
-        if selected.len() >= policy.max_victims || planned >= cushion {
+        if selected.len() >= policy.max_victims || planned >= target_bytes {
             break;
         }
         planned = planned.saturating_add(c.bytes);
         selected.push(c);
-        if planned >= target_bytes && selected.iter().all(|s| !s.needs_heap_unmake) {
-            break;
-        }
     }
 
     let mut unmade_slots = 0u64;
@@ -2544,10 +2602,11 @@ pub(crate) fn evict_lru_textures_with(
         .collect();
     if !heap_victims.is_empty() {
         if crate::host::submissions_in_flight() == 0 {
-            let (unmade, resources) = crate::descriptor::evict_kept_resources(
+            let (unmade, resources) = crate::descriptor::evict_kept_resources_with(
                 &heap_victims,
                 now_frame,
                 policy.slot_cooldown_frames,
+                policy.heap_idle_frames,
             );
             unmade_slots = unmade as u64;
             waiting_shader_resources = resources;
@@ -5275,8 +5334,12 @@ float4 lit() : SV_Target { return 1.0; }
             TEST_BUDGET_BYTES.store(0, std::sync::atomic::Ordering::Release);
             TEST_MIP_CLAMP_MODE.store(u32::MAX, std::sync::atomic::Ordering::Release);
             TEST_LRU_HEAP_EVICT.store(u8::MAX, std::sync::atomic::Ordering::Release);
+            TEST_LRU_HEAP_IDLE_FRAMES.store(u64::MAX, std::sync::atomic::Ordering::Release);
             TEST_EVICT_MIN_IDLE_MS.store(u64::MAX, std::sync::atomic::Ordering::Release);
             NEED_HEAP_EVICT.store(false, std::sync::atomic::Ordering::Release);
+            PENDING_WANT_BYTES.store(0, std::sync::atomic::Ordering::Release);
+            crate::descriptor::host::TEST_KEPT_VIEWS_YIELD
+                .store(u8::MAX, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -5420,6 +5483,7 @@ float4 lit() : SV_Target { return 1.0; }
                 EvictPolicy {
                     min_idle_ms: 0,
                     min_idle_frames: 0,
+                    heap_idle_frames: 0,
                     slot_cooldown_frames: 0,
                     max_victims: 4096,
                     allow_heap_unmake: true,
@@ -5527,6 +5591,7 @@ float4 lit() : SV_Target { return 1.0; }
             slot_cooldown_frames: 60,
             max_victims: 8,
             allow_heap_unmake: false,
+            ..EvictPolicy::default()
         };
         let outcome = evict_lru_textures_with(
             tex_bytes,
@@ -5614,6 +5679,7 @@ float4 lit() : SV_Target { return 1.0; }
                 EvictPolicy {
                     min_idle_ms: 0,
                     min_idle_frames: 0,
+                    heap_idle_frames: 0,
                     slot_cooldown_frames: 0,
                     max_victims: 4096,
                     allow_heap_unmake: true,
@@ -5713,6 +5779,7 @@ float4 lit() : SV_Target { return 1.0; }
                     slot_cooldown_frames: 60,
                     max_victims: 8,
                     allow_heap_unmake: lru_heap_evict_enabled(),
+                    ..EvictPolicy::default()
                 },
             )
         });
@@ -5788,6 +5855,7 @@ float4 lit() : SV_Target { return 1.0; }
                 slot_cooldown_frames: 60,
                 max_victims: 8,
                 allow_heap_unmake: false,
+                ..EvictPolicy::default()
             },
         );
         assert_eq!(off_submit.evicted_count, 0);
@@ -5796,6 +5864,7 @@ float4 lit() : SV_Target { return 1.0; }
             "opt-in heap eviction must schedule NEED_HEAP_EVICT when off-submit pass hits pinned textures"
         );
 
+        crate::frame::advance_for_test(120);
         let evict_before = LRU_EVICT_STATS[0].load(Relaxed);
         let unmade_before = LRU_EVICT_STATS[2].load(Relaxed);
         host.with_submit_lock_for_test(|| {
@@ -5845,6 +5914,7 @@ float4 lit() : SV_Target { return 1.0; }
                 EvictPolicy {
                     min_idle_ms: 0,
                     min_idle_frames: 0,
+                    heap_idle_frames: 0,
                     slot_cooldown_frames: 0,
                     max_victims: 4096,
                     allow_heap_unmake: true,
@@ -5918,10 +5988,10 @@ float4 lit() : SV_Target { return 1.0; }
             "shader-visible SRV slot must pin tex_old in HostHeap::kept"
         );
 
-        crate::frame::advance_for_test(3);
+        crate::frame::advance_for_test(5);
         let tex_recent = make_filled(0x77);
         upload_and_wait(tex_recent);
-        crate::frame::advance_for_test(5);
+        crate::frame::advance_for_test(2);
 
         let current_filled = KINDS[1].load(std::sync::atomic::Ordering::Relaxed);
         // Cap budget just below current `KINDS[1]` so `room_raw()` is false until `tex_old` evicts.
@@ -5938,6 +6008,7 @@ float4 lit() : SV_Target { return 1.0; }
                 EvictPolicy {
                     min_idle_ms: 0,
                     min_idle_frames: 4,
+                    heap_idle_frames: 4,
                     slot_cooldown_frames: 60,
                     max_victims: 4,
                     allow_heap_unmake: true,
@@ -6390,6 +6461,570 @@ float4 lit() : SV_Target { return 1.0; }
 
         assert_eq!(slot::<Release>(tex_bc7, 0x10)(tex_bc7), 0);
         assert_eq!(slot::<Release>(tex_rgba, 0x10)(tex_rgba), 0);
+        assert_eq!(slot::<Release>(srv_heap, 0x10)(srv_heap), 0);
+    }
+
+    #[test]
+    fn tier2_superseded_kept_views_yield_under_vram_pressure_without_evicting_live_textures() {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release as AtomicRelease};
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let _serial = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _knobs = TestKnobsGuard;
+        TEST_MIP_CLAMP_MODE.store(0, AtomicRelease);
+        TEST_LRU_HEAP_EVICT.store(0, AtomicRelease);
+        TEST_EVICT_MIN_IDLE_MS.store(0, AtomicRelease);
+        crate::descriptor::host::TEST_KEPT_VIEWS_YIELD.store(1, AtomicRelease);
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        host.with_submit_lock_for_test(|| {
+            let _ = evict_lru_textures_with(
+                u64::MAX >> 2,
+                host.completed_fence(),
+                host.last_signalled_fence(),
+                crate::host::submissions_in_flight(),
+                EvictPolicy {
+                    min_idle_ms: 0,
+                    min_idle_frames: 0,
+                    heap_idle_frames: 0,
+                    slot_cooldown_frames: 0,
+                    max_victims: 4096,
+                    allow_heap_unmake: true,
+                },
+            );
+        });
+        crate::host::flush_reaper_for_test();
+        crate::frame::advance_for_test(2);
+
+        let heap_desc = crate::descriptor::HeapDesc {
+            kind: 0,
+            count: 32,
+            flags: 1,
+            nodes: 0,
+        };
+        let mut srv_heap = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                &heap_desc,
+                &PAGEABLE_IIDS[0],
+                &mut srv_heap
+            ),
+            S_OK
+        );
+        let host_heap = crate::descriptor::heap(srv_heap)
+            .host()
+            .expect("host SRV heap");
+        let cpu_start = crate::descriptor::heap(srv_heap).start;
+
+        // 1. Create a placed texture `tex_superseded` and bind its low-mip view into slot 0 (`for_draw = true`).
+        let placed_res = [3u32, 0, 0, 0, 128, 0, 128, (8 << 16) | 1, 28, 1, 0, 0, 0, 0];
+        let placed_bytes_len = placed_bytes(&placed_res).unwrap() as usize;
+        let alloc_stride = (placed_bytes_len + 0xfff) & !0xfff;
+        let placed_mem = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                alloc_stride * 2,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!placed_mem.is_null());
+        unsafe {
+            std::ptr::write_bytes(placed_mem.cast::<u8>(), 0x55, alloc_stride * 2);
+        }
+        let addr = placed_mem as u64;
+        let mut placed_desc_low = [0u32; 16];
+        (
+            placed_desc_low[0],
+            placed_desc_low[1],
+            placed_desc_low[2],
+            placed_desc_low[4],
+            placed_desc_low[5],
+            placed_desc_low[10],
+            placed_desc_low[11],
+        ) = (28, 4, 5768, 2, 6, addr as u32, (addr >> 32) as u32);
+        let mut placed_desc_high = placed_desc_low;
+        (placed_desc_high[4], placed_desc_high[5]) = (0, 8);
+
+        crate::descriptor::create_placed_srv(
+            std::ptr::null(),
+            &placed_res,
+            &placed_desc_low,
+            cpu_start,
+        );
+        assert!(host_heap.mirror(0, cpu_start, true).is_some());
+        let tex_superseded = texture_at(addr, &placed_res).expect("placed resource");
+        {
+            let host_tex = host_resource(tex_superseded).expect("placed host texture");
+            let list = host.new_list().expect("upload list");
+            crate::texture::upload(&list, tex_superseded, host_tex);
+            let _ = list.transition(tex_superseded, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32);
+            list.close();
+            host.execute(&[&list]);
+        }
+        assert!(host_heap.made(0));
+        let superseded_bytes = host_copy(tex_superseded).unwrap().bytes;
+        assert!(superseded_bytes > 0);
+        assert!(host_copy(tex_superseded).is_some_and(|c| crate::host::references(&c.texture) >= 2));
+
+        // 2. Create a non-superseded live HostHeap-pinned texture `tex_live` in slot 1.
+        let desc = texture(128, 128, 28, 1);
+        let tex_footprint = footprint(&desc).unwrap().size as usize;
+        let mut tex_live = std::ptr::null();
+        assert_eq!(
+            create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut tex_live
+            ),
+            S_OK
+        );
+        unsafe {
+            std::ptr::write_bytes(resource(tex_live).data(), 0x77, tex_footprint);
+        }
+        {
+            let host_tex = host_resource(tex_live).expect("live host texture");
+            let list = host.new_list().expect("upload live list");
+            crate::texture::upload(&list, tex_live, host_tex);
+            let _ = list.transition(tex_live, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32);
+            list.close();
+            host.execute(&[&list]);
+        }
+        crate::descriptor::create_srv(std::ptr::null(), tex_live, std::ptr::null(), cpu_start + 32);
+        assert!(host_heap.made(1));
+        assert!(host_copy(tex_live).is_some_and(|c| crate::host::references(&c.texture) >= 2));
+
+        // 3. Supersede slot 0 with a sharper placed view (`for_draw = false`): `keep_views()` keeps
+        // the old copy pinned (`made(0) == true`) and adds slot 0 to `keeping`.
+        crate::descriptor::create_placed_srv(
+            std::ptr::null(),
+            &placed_res,
+            &placed_desc_high,
+            cpu_start,
+        );
+        assert!(host_heap.made(0), "keep_views must keep older view pinned until pressure");
+
+        crate::frame::advance_for_test(6);
+
+        // 4. Trigger VRAM pressure (`!room_raw()`) with default `VICTORY_TEXTURE_LRU_HEAP_EVICT` OFF:
+        // Tier 2 yields slot 0 so `tex_superseded` drops to `refs == 1` and evicts, while
+        // non-superseded `tex_live` in slot 1 stays completely untouched!
+        let current_filled = KINDS[1].load(Relaxed);
+        TEST_BUDGET_BYTES.store(
+            current_filled.saturating_sub(superseded_bytes / 2).max(1),
+            AtomicRelease,
+        );
+        assert!(!room_raw());
+
+        host.with_submit_lock_for_test(evict_if_pressured);
+        assert!(!host_heap.made(0), "superseded slot 0 must yield under VRAM pressure");
+        assert!(
+            !is_resident_for_test(tex_superseded),
+            "yielded superseded old texture must evict once refs drop to 1"
+        );
+        assert!(host_heap.made(1), "non-superseded slot 1 must remain made");
+        assert!(
+            is_resident_for_test(tex_live),
+            "non-superseded live HostHeap texture must stay resident"
+        );
+        assert!(
+            host_copy(tex_live).is_some_and(|c| crate::host::references(&c.texture) >= 2),
+            "non-superseded live texture must retain HostHeap COM ref"
+        );
+
+        // 5. Also verify `want > 0` triggers Tier 2 yield even when `room_raw()` is true.
+        TEST_BUDGET_BYTES.store(0, AtomicRelease);
+        assert!(room_raw());
+        let addr2 = addr + alloc_stride as u64;
+        let placed_res2 = [3u32, 0, 0, 0, 64, 0, 64, (7 << 16) | 1, 28, 1, 0, 0, 0, 0];
+        let mut desc2_low = placed_desc_low;
+        (desc2_low[4], desc2_low[5], desc2_low[10], desc2_low[11]) =
+            (2, 5, addr2 as u32, (addr2 >> 32) as u32);
+        let mut desc2_high = desc2_low;
+        (desc2_high[4], desc2_high[5]) = (0, 7);
+        let slot0_handle = cpu_start;
+        crate::descriptor::create_placed_srv(
+            std::ptr::null(),
+            &placed_res2,
+            &desc2_low,
+            slot0_handle,
+        );
+        assert!(host_heap.mirror(0, slot0_handle, true).is_some());
+        let tex2 = texture_at(addr2, &placed_res2).expect("placed resource 2");
+        assert!(host_heap.made(0));
+        crate::descriptor::create_placed_srv(
+            std::ptr::null(),
+            &placed_res2,
+            &desc2_high,
+            slot0_handle,
+        );
+        assert!(host_heap.made(0));
+        PENDING_WANT_BYTES.store(16 << 20, AtomicRelease);
+        host.with_submit_lock_for_test(evict_if_pressured);
+        assert_eq!(PENDING_WANT_BYTES.load(Acquire), 0);
+        assert!(
+            !host_heap.made(0),
+            "want > 0 must also invoke yield_kept_views in evict_if_pressured"
+        );
+        assert!(host_heap.made(1));
+
+        crate::host::flush_reaper_for_test();
+        let mut clean_key = placed_res;
+        clean_key[1] = 0;
+        clean_key[13] = 0;
+        let mut clean_key2 = placed_res2;
+        clean_key2[1] = 0;
+        clean_key2[13] = 0;
+        {
+            let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+            map.remove(&(addr, clean_key));
+            map.remove(&(addr2, clean_key2));
+        }
+        assert_eq!(slot::<Release>(tex_superseded, 0x10)(tex_superseded), 0);
+        assert_eq!(slot::<Release>(tex2, 0x10)(tex2), 0);
+        assert_eq!(slot::<Release>(tex_live, 0x10)(tex_live), 0);
+        assert_eq!(slot::<Release>(srv_heap, 0x10)(srv_heap), 0);
+        unsafe {
+            let _ = VirtualFree(placed_mem, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn tier3_lru_heap_evict_respects_recency_guard_oldest_first_and_30_frame_cooldown() {
+        use std::sync::atomic::Ordering::{Relaxed, Release as AtomicRelease};
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        assert_eq!(parse_lru_heap_idle_frames(None), 120);
+        assert_eq!(parse_lru_heap_idle_frames(Some("abc")), 120);
+        assert_eq!(parse_lru_heap_idle_frames(Some("90")), 90);
+        assert_eq!(EvictPolicy::default().slot_cooldown_frames, 30);
+        assert_eq!(EvictPolicy::default().heap_idle_frames, 120);
+
+        let _serial = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _knobs = TestKnobsGuard;
+        TEST_MIP_CLAMP_MODE.store(0, AtomicRelease);
+        TEST_EVICT_MIN_IDLE_MS.store(0, AtomicRelease);
+        if std::env::var_os("VICTORY_TEXTURE_LRU_HEAP_EVICT").is_none() {
+            assert!(
+                !lru_heap_evict_enabled(),
+                "VICTORY_TEXTURE_LRU_HEAP_EVICT must remain OFF by default"
+            );
+        }
+        TEST_LRU_HEAP_EVICT.store(1, AtomicRelease);
+        TEST_LRU_HEAP_IDLE_FRAMES.store(120, AtomicRelease);
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        host.with_submit_lock_for_test(|| {
+            let _ = evict_lru_textures_with(
+                u64::MAX >> 2,
+                host.completed_fence(),
+                host.last_signalled_fence(),
+                crate::host::submissions_in_flight(),
+                EvictPolicy {
+                    min_idle_ms: 0,
+                    min_idle_frames: 0,
+                    heap_idle_frames: 0,
+                    slot_cooldown_frames: 0,
+                    max_victims: 4096,
+                    allow_heap_unmake: true,
+                },
+            );
+        });
+        crate::host::flush_reaper_for_test();
+        crate::frame::advance_for_test(2);
+
+        let null = std::ptr::null();
+        let desc = texture(128, 128, 28, 1);
+        let tex_footprint = footprint(&desc).unwrap().size as usize;
+        let make_and_upload = |fill_byte: u8| -> This {
+            let mut out = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out
+                ),
+                S_OK
+            );
+            unsafe {
+                std::ptr::write_bytes(resource(out).data(), fill_byte, tex_footprint);
+            }
+            let host_tex = host_resource(out).expect("host texture");
+            let list = host.new_list().expect("upload list");
+            crate::texture::upload(&list, out, host_tex);
+            let _ = list.transition(out, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32);
+            list.close();
+            host.execute(&[&list]);
+            out
+        };
+
+        let heap_desc = crate::descriptor::HeapDesc {
+            kind: 0,
+            count: 32,
+            flags: 1,
+            nodes: 0,
+        };
+        let mut srv_heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                &heap_desc,
+                &PAGEABLE_IIDS[0],
+                &mut srv_heap
+            ),
+            S_OK
+        );
+        let host_heap = crate::descriptor::heap(srv_heap)
+            .host()
+            .expect("host SRV heap");
+        let cpu_start = crate::descriptor::heap(srv_heap).start;
+
+        // Bind `tex_slot2_oldest` in slot 2 first (oldest `last_used_frame`),
+        // then `tex_slot0_mid` in slot 0 and `tex_slot1_hot` in slot 1 ten frames later.
+        let tex_slot2_oldest = make_and_upload(0x11);
+        crate::descriptor::create_srv(null, tex_slot2_oldest, std::ptr::null(), cpu_start + 64);
+        let tex_bytes = host_copy(tex_slot2_oldest).unwrap().bytes;
+
+        crate::frame::advance_for_test(10);
+        let tex_slot0_mid = make_and_upload(0x22);
+        crate::descriptor::create_srv(null, tex_slot0_mid, std::ptr::null(), cpu_start);
+        let tex_slot1_hot = make_and_upload(0x33);
+        crate::descriptor::create_srv(null, tex_slot1_hot, std::ptr::null(), cpu_start + 32);
+        for &(slot_idx, write) in &host_heap.texture_slots_due(u64::MAX, 16).0 {
+            host_heap.texture_slot_done(slot_idx, write, None);
+        }
+
+        // Advance 100 frames and draw slot 1 via `HostHeap::mirror(..., true)`:
+        // `HostTexture::last_used_frame` stays old, while `HostHeap`'s per-slot
+        // `last_used_frame[1]` refreshes to `now`.
+        crate::frame::advance_for_test(100);
+        assert!(host_heap.mirror(1, cpu_start + 32, true).is_some());
+        let hot_frame = host_heap.slot_last_used_frame(1);
+        assert_eq!(hot_frame, crate::frame::current());
+
+        // Advance 30 more frames:
+        // - slot 2 age = 140 >= 120 (oldest)
+        // - slot 0 age = 130 >= 120 (second oldest)
+        // - slot 1 age = 30 < 120 (protected!)
+        crate::frame::advance_for_test(30);
+
+        // Evict enough for 1 texture: slot 2 MUST evict BEFORE slot 0 (oldest `last_used_frame`,
+        // not arbitrary slot index 0 < 2!).
+        let outcome = host.with_submit_lock_for_test(|| {
+            evict_lru_textures_with(
+                tex_bytes,
+                host.completed_fence(),
+                host.last_signalled_fence(),
+                crate::host::submissions_in_flight(),
+                EvictPolicy {
+                    min_idle_ms: 0,
+                    allow_heap_unmake: true,
+                    ..EvictPolicy::default()
+                },
+            )
+        });
+        assert_eq!(outcome.evicted_count, 1);
+        assert!(!host_heap.made(2), "oldest slot 2 must evict first");
+        assert!(!is_resident_for_test(tex_slot2_oldest));
+        assert!(host_heap.made(0), "newer slot 0 must stay while budget only asked for 1");
+        assert!(is_resident_for_test(tex_slot0_mid));
+        assert!(host_heap.made(1), "hot slot 1 within 120 frames must stay protected");
+        assert!(is_resident_for_test(tex_slot1_hot));
+
+        // Verify 30-frame cooldown on `EvictPolicy::default()`: slot 2 re-queued at `now + 30`.
+        let now_frame = crate::frame::current();
+        assert!(host_heap.texture_slots_due(now_frame + 29, 16).0.is_empty());
+        assert_eq!(
+            host_heap.texture_slots_due(now_frame + 30, 16).0,
+            vec![(2, 0)]
+        );
+
+        // Now trigger `evict_if_pressured()` with tight budget: slot 0 evicts, while hot slot 1
+        // STILL remains protected within `VICTORY_TEXTURE_LRU_HEAP_IDLE_FRAMES=120`!
+        let current_filled = KINDS[1].load(Relaxed);
+        TEST_BUDGET_BYTES.store(
+            current_filled.saturating_sub(tex_bytes * 2).max(1),
+            AtomicRelease,
+        );
+        host.with_submit_lock_for_test(evict_if_pressured);
+        assert!(!host_heap.made(0), "cold slot 0 must evict under pressure");
+        assert!(!is_resident_for_test(tex_slot0_mid));
+        assert!(
+            host_heap.made(1),
+            "hot slot 1 within VICTORY_TEXTURE_LRU_HEAP_IDLE_FRAMES=120 must remain protected"
+        );
+        assert!(is_resident_for_test(tex_slot1_hot));
+
+        crate::host::flush_reaper_for_test();
+        assert_eq!(slot::<Release>(tex_slot2_oldest, 0x10)(tex_slot2_oldest), 0);
+        assert_eq!(slot::<Release>(tex_slot0_mid, 0x10)(tex_slot0_mid), 0);
+        assert_eq!(slot::<Release>(tex_slot1_hot, 0x10)(tex_slot1_hot), 0);
+        assert_eq!(slot::<Release>(srv_heap, 0x10)(srv_heap), 0);
+    }
+
+    #[test]
+    fn tier3_lru_heap_evict_prioritizes_refs1_before_heap_pinned_and_ignores_non_heap_pins() {
+        use std::sync::atomic::Ordering::Release as AtomicRelease;
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        let _serial = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _knobs = TestKnobsGuard;
+        TEST_MIP_CLAMP_MODE.store(0, AtomicRelease);
+        TEST_EVICT_MIN_IDLE_MS.store(0, AtomicRelease);
+        TEST_LRU_HEAP_EVICT.store(1, AtomicRelease);
+        TEST_LRU_HEAP_IDLE_FRAMES.store(120, AtomicRelease);
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        host.with_submit_lock_for_test(|| {
+            let _ = evict_lru_textures_with(
+                u64::MAX >> 2,
+                host.completed_fence(),
+                host.last_signalled_fence(),
+                crate::host::submissions_in_flight(),
+                EvictPolicy {
+                    min_idle_ms: 0,
+                    min_idle_frames: 0,
+                    heap_idle_frames: 0,
+                    slot_cooldown_frames: 0,
+                    max_victims: 4096,
+                    allow_heap_unmake: true,
+                },
+            );
+        });
+        crate::host::flush_reaper_for_test();
+        crate::frame::advance_for_test(2);
+
+        let null = std::ptr::null();
+        let desc = texture(128, 128, 28, 1);
+        let tex_footprint = footprint(&desc).unwrap().size as usize;
+        let make_and_upload = |fill_byte: u8| -> This {
+            let mut out = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut out
+                ),
+                S_OK
+            );
+            unsafe {
+                std::ptr::write_bytes(resource(out).data(), fill_byte, tex_footprint);
+            }
+            let host_tex = host_resource(out).expect("host texture");
+            let list = host.new_list().expect("upload list");
+            crate::texture::upload(&list, out, host_tex);
+            let _ = list.transition(out, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32);
+            list.close();
+            host.execute(&[&list]);
+            out
+        };
+
+        let heap_desc = crate::descriptor::HeapDesc {
+            kind: 0,
+            count: 32,
+            flags: 1,
+            nodes: 0,
+        };
+        let mut srv_heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(null, &heap_desc, &PAGEABLE_IIDS[0], &mut srv_heap),
+            S_OK
+        );
+        let host_heap = crate::descriptor::heap(srv_heap)
+            .host()
+            .expect("host SRV heap");
+        let cpu_start = crate::descriptor::heap(srv_heap).start;
+
+        // 1) Older `tex_non_heap_pinned` in slot 0 with an extra non-heap COM ref (`refs >= 3` vs `kept_refs == 1`),
+        //    and older `tex_heap_cold` in slot 1 (`refs == 2`, `kept_refs == 1`).
+        let tex_non_heap_pinned = make_and_upload(0x11);
+        crate::descriptor::create_srv(null, tex_non_heap_pinned, std::ptr::null(), cpu_start);
+        let non_heap_copy = host_copy(tex_non_heap_pinned).expect("non-heap copy");
+        let tex_bytes = non_heap_copy.bytes;
+        let extra_pin = non_heap_copy.texture.clone();
+        drop(non_heap_copy);
+
+        let tex_heap_cold = make_and_upload(0x22);
+        crate::descriptor::create_srv(null, tex_heap_cold, std::ptr::null(), cpu_start + 32);
+        for &(slot_idx, write) in &host_heap.texture_slots_due(u64::MAX, 16).0 {
+            host_heap.texture_slot_done(slot_idx, write, None);
+        }
+
+        // 2) Newer `tex_dead_unpinned` (`refs == 1`, not in any HostHeap) created 10 frames later.
+        crate::frame::advance_for_test(10);
+        let tex_dead_unpinned = make_and_upload(0x33);
+
+        crate::frame::advance_for_test(130);
+
+        // Pass 1 (budget = 1 texture): `refs == 1` (`needs_heap_unmake == false`) MUST evict before older `HostHeap`-pinned.
+        let pass1 = host.with_submit_lock_for_test(|| {
+            evict_lru_textures_with(
+                tex_bytes,
+                host.completed_fence(),
+                host.last_signalled_fence(),
+                crate::host::submissions_in_flight(),
+                EvictPolicy {
+                    min_idle_ms: 0,
+                    allow_heap_unmake: true,
+                    ..EvictPolicy::default()
+                },
+            )
+        });
+        assert_eq!(pass1.evicted_count, 1);
+        assert!(!is_resident_for_test(tex_dead_unpinned), "refs==1 dead texture must evict ahead of HostHeap-pinned");
+        assert!(host_heap.made(1) && is_resident_for_test(tex_heap_cold));
+        assert!(host_heap.made(0) && is_resident_for_test(tex_non_heap_pinned));
+
+        // Pass 2 (large budget): `tex_non_heap_pinned` (`refs > 1 + kept_refs`) MUST stay skipped so slot 0 is NOT uselessly unmade,
+        // while `tex_heap_cold` (`refs == 1 + kept_refs`) evicts cleanly without starvation.
+        let pass2 = host.with_submit_lock_for_test(|| {
+            evict_lru_textures_with(
+                tex_bytes * 8,
+                host.completed_fence(),
+                host.last_signalled_fence(),
+                crate::host::submissions_in_flight(),
+                EvictPolicy {
+                    min_idle_ms: 0,
+                    allow_heap_unmake: true,
+                    ..EvictPolicy::default()
+                },
+            )
+        });
+        assert_eq!(pass2.evicted_count, 1);
+        assert!(!host_heap.made(1) && !is_resident_for_test(tex_heap_cold));
+        assert!(host_heap.made(0), "non-heap-pinned slot 0 must NOT be unmade");
+        assert!(is_resident_for_test(tex_non_heap_pinned));
+
+        drop(extra_pin);
+        crate::host::flush_reaper_for_test();
+        assert_eq!(slot::<Release>(tex_non_heap_pinned, 0x10)(tex_non_heap_pinned), 0);
+        assert_eq!(slot::<Release>(tex_heap_cold, 0x10)(tex_heap_cold), 0);
+        assert_eq!(slot::<Release>(tex_dead_unpinned, 0x10)(tex_dead_unpinned), 0);
         assert_eq!(slot::<Release>(srv_heap, 0x10)(srv_heap), 0);
     }
 }
