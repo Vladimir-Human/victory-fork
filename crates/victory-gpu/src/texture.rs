@@ -41,8 +41,10 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice on the host texture.
     mips: u32,
+    /// Console mip index mapped to host mip 0 (`0` unless mip-clamped).
+    base_mip: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -1351,6 +1353,7 @@ impl Staging {
         let _timed = DetileTimed(started);
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let src_mip = self.base_mip + mip;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -1365,9 +1368,9 @@ impl Staging {
             }
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, src_mip, slice, linear, pitch, pitch * rows as usize)
             {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+                tracing::warn!(?e, mip = src_mip, slice, "texture not detiled");
                 return;
             }
         }
@@ -1388,10 +1391,14 @@ impl Drop for DetileTimed {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
+    let _ = take_staged(resource);
+}
+
+/// Removes and returns a title texture's staging buffer so the caller can
+/// drop it outside locks.
+pub(crate) fn take_staged(resource: This) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
-    }
+    map.as_mut()?.remove(&(resource as usize))
 }
 
 /// Where a staged title texture's memory is: address and bytes.
@@ -1614,15 +1621,27 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
-/// The staging state of a title texture, made on first use.
+/// The staging state of a title texture, made on first use or rebuilt if the
+/// resident host texture changed dimensions/mip count (e.g. `ensure_unclamped`).
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
-        return Some(s.clone());
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let host_mips = u32::from(d.MipLevels);
+    {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(HashMap::new);
+        if let Some(s) = map.get(&(resource as usize))
+            && s.mips == host_mips
+            && s.on_demand == on_demand
+            && s.footprints.first().is_some_and(|f| {
+                u64::from(f.Footprint.Width) == d.Width && f.Footprint.Height == d.Height
+            })
+        {
+            return Some(s.clone());
+        }
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -1638,12 +1657,15 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return None;
     }
     let host = host()?;
-    // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
-    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-        u32::from(d.MipLevels)
+    let base_mip = if on_demand {
+        0
     } else {
-        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
+        (layout.mips.len() as u32).saturating_sub(host_mips)
+    };
+    let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        host_mips
+    } else {
+        host_mips * u32::from(d.DepthOrArraySize)
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
@@ -1662,8 +1684,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         );
     }
     // On the card's way (`VICTORY_GPU_DETILE`): the dispatches, if every
-    // subresource can be detiled so, and the buffer they write.
-    let gpu = if crate::gpudetile::on() && crate::gpudetile::detiler().is_some() {
+    // subresource can be detiled so, and the buffer they write. When
+    // `base_mip > 0` (mip-clamped host texture), fall back to CPU detile
+    // because `gpudetile::jobs` indexes `layout` from mip 0.
+    let gpu = if base_mip == 0 && crate::gpudetile::on() && crate::gpudetile::detiler().is_some() {
         let raw = crate::gpudetile::raw_layout(&layout);
         let jobs = crate::gpudetile::jobs(&layout, &footprints, &rows, u32::from(d.MipLevels), &raw);
         let linear = jobs.as_ref().and_then(|_| linear_buffer(host, total));
@@ -1704,7 +1728,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         footprints,
         rows,
         layout,
-        mips: u32::from(d.MipLevels),
+        mips: host_mips,
+        base_mip,
         bytes: total,
         memory,
         last: Mutex::default(),
@@ -1718,7 +1743,16 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         pooled,
         gpu,
     });
-    map.insert(resource as usize, s.clone());
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    // Never overwrite an already-upgraded higher-mip `Staging` with a racing
+    // stale lower-mip entry; still return `s` for the caller's own `texture`.
+    if map
+        .get(&(resource as usize))
+        .is_none_or(|old| old.mips <= host_mips && old.on_demand == on_demand)
+    {
+        map.insert(resource as usize, s.clone());
+    }
     Some(s)
 }
 
@@ -1769,6 +1803,22 @@ fn refresh_unlocked_with(
         last.asked = 0;
         0
     }
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn staging_shape_for_test(
+    resource: This,
+    texture: &ID3D12Resource,
+) -> Option<(u32, u32, u32, u32)> {
+    let s = staging(resource, texture)?;
+    let f0 = s.footprints.first()?.Footprint;
+    Some((s.mips, s.base_mip, f0.Width, f0.Height))
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn cached_staging_mips_for_test(resource: This) -> Option<u32> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    Some(map.as_ref()?.get(&(resource as usize))?.mips)
 }
 
 #[cfg(test)]

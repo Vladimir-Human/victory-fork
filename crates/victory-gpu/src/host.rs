@@ -45,6 +45,8 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// Atomic mirror of the highest value signalled on `fence`.
+    last_signalled: std::sync::atomic::AtomicU64,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -1416,6 +1418,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            last_signalled: std::sync::atomic::AtomicU64::new(0),
             event,
             rtvs,
             rtv_size,
@@ -6998,6 +7001,7 @@ impl Host {
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
+                    self.last_signalled.store(*submitted, Ordering::Release);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -7397,7 +7401,13 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        if late && flying() && crate::resource::has_unclamped_rebinds() {
+            self.settle(&mut submitted, WHY_SYNC);
+        }
         let behind = late && flying();
+        if !behind {
+            crate::resource::evict_if_pressured();
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run (with the pass, beside, after it).
         if beside {
@@ -7502,12 +7512,18 @@ impl Host {
         prep_part(4, part);
         let prepared = std::time::Instant::now();
         if late {
-            *submitted += 1;
+            let frame = crate::frame::current();
+            let next_fence = *submitted + 1;
+            for list in runs {
+                list.stamp_textures(frame, next_fence);
+            }
+            *submitted = next_fence;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            self.last_signalled.store(*submitted, Ordering::Release);
             self.card_sent();
             prep_part(5, prepared);
             if let Err(e) = signalled {
@@ -7547,8 +7563,17 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        let frame = crate::frame::current();
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
+            let next_fence = *submitted + 1;
+            if groups.len() == runs.len() {
+                runs[i].stamp_textures(frame, next_fence);
+            } else {
+                for list in runs {
+                    list.stamp_textures(frame, next_fence);
+                }
+            }
+            *submitted = next_fence;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -7557,6 +7582,7 @@ impl Host {
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
+                    .map(|()| self.last_signalled.store(*submitted, Ordering::Release))
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
@@ -8293,6 +8319,14 @@ impl HostList {
             crate::shot::leaves(&self.list, std::ptr::from_ref(self) as usize, Some(self), None, &copy, before, wanted);
         }
         Some((texture, before))
+    }
+
+    /// Stamps `frame` and `fence` onto every host texture this list holds.
+    pub(crate) fn stamp_textures(&self, frame: u64, fence: u64) {
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, _, copy) in states.values() {
+            copy.note_submitted(frame, fence);
+        }
     }
 
     /// Moves host texture `copy` to `wanted` (a host state) in this list,
@@ -10624,6 +10658,45 @@ impl Host {
     /// given memory ahead of the list that uploads them).
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
         &self.queue
+    }
+
+    pub(crate) fn completed_fence(&self) -> u64 {
+        // SAFETY: a plain fence query.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
+    pub(crate) fn last_signalled_fence(&self) -> u64 {
+        self.last_signalled.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fence(&self) -> &ID3D12Fence {
+        &self.fence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_submit_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_fenced_for_test(&self, list: &HostList, release_states: bool) -> u64 {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let next = *submitted + 1;
+        list.stamp_textures(crate::frame::current(), next);
+        if release_states {
+            list.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        *submitted = next;
+        let cmd: Option<ID3D12CommandList> = list.list.cast().ok();
+        // SAFETY: closed list and our fence, under `submitted`.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[cmd]);
+            self.queue.Signal(&self.fence, next).expect("signal host fence");
+        }
+        self.last_signalled.store(next, Ordering::Release);
+        next
     }
 
     /// A buffer in the upload heap, mapped for writing.

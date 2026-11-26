@@ -873,6 +873,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         };
         // A copy on the card may write a buffer: no indirect draw after it joins a window before it.
         crate::indirect::end_window(list);
+        crate::resource::ensure_unclamped(dst);
+        crate::resource::ensure_unclamped(src);
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -974,6 +976,10 @@ extern "system" fn copy_texture_region(
         // A copy on the card (textures, or texels read back into a buffer of ours): no indirect draw after it joins
         // a window before it (conservative: none of these writes an argument buffer).
         crate::indirect::end_window(list);
+        crate::resource::ensure_unclamped(dst.resource);
+        if src.kind != FOOTPRINT {
+            crate::resource::ensure_unclamped(src.resource);
+        }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1148,6 +1154,7 @@ fn read_back(
     // The title's buffer holds every row at its own pitch.
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
+    crate::resource::ensure_unclamped(src.resource);
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
@@ -1205,6 +1212,10 @@ extern "system" fn resolve(
 ) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
+        && let () = {
+            crate::resource::ensure_unclamped(dst);
+            crate::resource::ensure_unclamped(src);
+        }
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
