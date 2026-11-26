@@ -9236,7 +9236,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     /// and `LAZY_ARMED_COUNT == 0` after teardown.
     #[test]
     fn lazy_copyback_remap_drop_unregister_virtual_lifecycle() {
-        use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, PAGE_NOACCESS, PAGE_READWRITE};
         let _guard = LazyTestGuard::enable();
         let Some(h) = host() else {
             return;
@@ -9249,16 +9249,37 @@ void main(uint3 tid : SV_DispatchThreadID) {
         };
         let list = h.new_list().expect("new_list");
 
-        // 1. Virgin demand-zero `MEM_WRITE_WATCH` stays safely eager on Frame 1
-        //    (no `PAGE_READONLY` downgrade during arming!), arms cleanly on Frame 2,
-        //    then exercises `title_memory_remapped`, `before_virtual_protect`, and `Shadow::drop`.
+        // 1. The first GPU write is visible even when the OS reports a clean
+        // demand-zero page. Then exercise remap, protection and destruction.
         {
             let block = VirtualBlock::new(3 * PAGE, true);
             let shadow = make_test_shadow(h, block.addr() as u64, (3 * PAGE) as u64, true).expect("shadow");
-            // Frame 1 on untouched virgin demand-zero pages: stays safely eager.
             pipe.dispatch_on(h, &list, &shadow, 0, 3 * PAGE, 0x1111_0000, 1);
+            for offset in (0..3 * PAGE).step_by(PAGE) {
+                let at = block.addr() + offset;
+                match page_protect(at) {
+                    PAGE_READWRITE => {}
+                    PAGE_NOACCESS => {
+                        // A first-touch page can be deferred only if write-watch
+                        // reports no CPU writes. Query without resetting it.
+                        let mut addresses = [std::ptr::null_mut(); 16];
+                        let mut count = addresses.len();
+                        let mut granularity = 0;
+                        // SAFETY: the block owns this aligned 64 KiB watched range.
+                        let status = unsafe {
+                            GetWriteWatch(0, at as *const _, PAGE, addresses.as_mut_ptr(), &mut count, &mut granularity)
+                        };
+                        assert_eq!(status, 0);
+                        assert_eq!(count, 0);
+                    }
+                    protect => panic!("unexpected first-touch page protection {protect:#x}"),
+                }
+                // SAFETY: the committed page is readable directly or via demand copy-back.
+                assert_eq!(unsafe { (at as *const u32).read_volatile() }, 0x1111_0000 ^ (offset / 4) as u32);
+                assert_eq!(page_protect(at), PAGE_READWRITE);
+            }
             assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 0);
-            // Frame 2: pages are now resident and clean -> arms all 3 with `GetWriteWatch(0) == 0`.
+            // All three pages have been read and are clean for frame 2.
             pipe.dispatch_on(h, &list, &shadow, 0, 3 * PAGE, 0xABCD_1234, 1);
             assert_eq!(shadow.deferred_count.load(Ordering::Acquire), 3);
 
