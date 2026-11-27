@@ -132,6 +132,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether the shader's code can store through raw addresses
+    /// ([`stores_by_address`]).
+    pub(crate) stores_by_address: bool,
     /// A compute shader's group size (`numthreads`); `[0; 3]` for other
     /// stages. A `DispatchX` that counts threads is made groups with it.
     pub(crate) threads: [u32; 3],
@@ -202,6 +205,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let main = programs.into_iter().find(|p| {
         matches!(
             p.stage,
@@ -213,7 +217,29 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => [0; 3],
     };
     let used = main.map(|p| p.used).unwrap_or_default();
-    Ok(Translated { host, used, stores, threads })
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        stores_by_address,
+        threads,
+    })
+}
+
+/// Whether a native program can store or run atomics through raw addresses
+/// (`crate::memory`): flat/global stores or atomics (excluding scratch), or
+/// undecodable bytecode. Ray-tracing structure walkers only read by address.
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        matches!(i.encoding, Encoding::Flat | Encoding::Global)
+            && i.name()
+                .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder

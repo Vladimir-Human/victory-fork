@@ -1529,12 +1529,7 @@ impl State {
             return 0;
         }
         // The title address of the buffer view at that dword of the table.
-        let address = match self.roots_ref(compute).get(usize::from(slot)) {
-            Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
-                .and_then(|view| crate::descriptor::host::view_address(&view))
-                .unwrap_or(0),
-            _ => 0,
-        };
+        let address = self.view_address(compute, slot, dword);
         if address == 0 {
             once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
         }
@@ -1545,23 +1540,57 @@ impl State {
         }
     }
 
+    /// Title address of the buffer view at `dword` of descriptor table root `slot`.
+    fn view_address(&self, compute: bool, slot: u8, dword: u32) -> u64 {
+        match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(&Root::Table(table)) => crate::descriptor::view(table + u64::from(dword) * 4)
+                .and_then(|view| crate::descriptor::host::view_address(&view))
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     /// For a shader that reads title memory by address
     /// ([`crate::memory`]): its directory, fault notes and view slots,
-    /// with the pages of the root views the list has set made ready.
-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
+    /// with pages made ready for the root views, UAVs, root constants and
+    /// structure views (`USER_VIEW_ADDRESS`) this dispatch names.
+    fn memory_ready(
+        &self,
+        list: &HostList,
+        t: &crate::pipeline::Translated,
+        compute: bool,
+        use_: crate::memory::Use,
+    ) -> Option<crate::memory::Ready> {
         let heap = match self.heaps[0] {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
         let (mut addresses, mut constants) = (Vec::new(), Vec::new());
+        let written: Vec<u64> = t
+            .used
+            .iter()
+            .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Descriptor)
+            .filter_map(|u| match self.roots_ref(compute).get(usize::from(u.slot)) {
+                Some(&Root::View(address)) => Some(address),
+                _ => None,
+            })
+            .collect();
         for root in self.roots_ref(compute) {
             match root {
-                Root::View(address) => addresses.push(*address),
+                // Walkers (`Use::Reads`) take structure addresses from
+                // `USER_VIEW_ADDRESS` below; their root views are constant/table data.
+                Root::View(address) if use_ != crate::memory::Use::Reads => addresses.push(*address),
                 Root::Constants(values) => constants.extend_from_slice(values),
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        for u in &t.host.user_data {
+            if u.root == RootType::Other(victory_shader::emit::USER_VIEW_ADDRESS) {
+                addresses.push(self.view_address(compute, u.slot, u.dword));
+            }
+        }
+        let threads = (compute && t.threads != [0; 3]).then_some(t.threads);
+        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, threads)
     }
 
     /// The bound heap holding `handle`.
@@ -1755,7 +1784,14 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let use_ = if crate::pipeline::is_builder(self.pipeline as This)
+                    || (writes && t.stores_by_address)
+                {
+                    crate::memory::Use::Builds { back: writes }
+                } else {
+                    crate::memory::Use::Reads
+                };
+                let Some(ready) = self.memory_ready(list, t, compute, use_) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };

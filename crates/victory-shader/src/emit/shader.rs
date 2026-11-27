@@ -57,27 +57,24 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 /// - the root SRV `t<SLOT_MEMORY>` in [`ROOT_CBV_SPACE`] is a directory of
 ///   [`MEMORY_PAGES`] entries of two dwords, one per 64 KiB of title
 ///   address space: the number of the host copy holding that page (0: none
-///   yet) and the page's byte offset in that copy;
+///   yet; with [`MEMORY_READ_ONLY`]: stores there are dropped) and the
+///   page's byte offset in that copy;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
 ///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
-///   host reads afterwards to make those copies for the frames to come;
-///   after them, [`MEMORY_PAGES`] dwords, one per page: a store or atomic
-///   through an address sets its page's dword to 1 (the host reads and
-///   clears them, and copies back only pages shaders wrote). The buffer is
-///   [`MEMORY_NOTES`] dwords in all.
+///   host reads afterwards to make those copies for the frames to come.
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
+/// Set on a directory entry's copy number when stores by address to that
+/// page are dropped (reads still see the copy).
+pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
-/// Dwords of the [`SLOT_FAULTS`] buffer in all: the fault notes, then one
-/// written flag per directory page (dword [`MEMORY_FAULTS`] + page).
-pub const MEMORY_NOTES: u32 = MEMORY_FAULTS + MEMORY_PAGES;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

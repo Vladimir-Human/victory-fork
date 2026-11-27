@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -80,6 +80,18 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// When set, refreshes of a VRAM-backed copy diff dword-by-dword against
+    /// `Card::staging` so GPU stores outside changed dwords are preserved
+    /// (`by_address`, `keep_stores`).
+    changes_only: AtomicBool,
+    /// Bytes counted in [`BY_ADDRESS_CARD_BYTES`] for this copy (0 unless it
+    /// is a VRAM-resident [`by_address`] copy).
+    by_address_card: u64,
+    /// For a [`by_address`] arena that spilled to PC RAM without a duplicate
+    /// staging buffer: exact `(from, to)` byte offsets in `self.start` to copy
+    /// directly into `self.data` during [`Shadow::update`] without overwriting
+    /// GPU-written dwords elsewhere on the same 64 KiB page.
+    spilled_runs: Option<Mutex<Vec<(usize, usize)>>>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -352,7 +364,9 @@ pub(crate) fn card_stats() -> [u64; 10] {
         }
         carded.iter().filter(|w| w.strong_count() > 0).count() as u64
     };
-    out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
+    out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
+        + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
 }
@@ -452,6 +466,9 @@ fn window_card_most() -> u64 {
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Bytes alive of raw-address directory and arena buffers in VRAM
+/// ([`by_address`]).
+static BY_ADDRESS_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Whether windows that go to the card's memory are one buffer in a GPU
 /// upload heap, which the CPU fills directly (`VICTORY_WINDOW_UPLOAD=1`;
@@ -2983,14 +3000,19 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
+        if self.by_address_card != 0 {
+            BY_ADDRESS_CARD_BYTES.fetch_sub(self.by_address_card, Ordering::Relaxed);
+        }
         if self.uploaded != 0 {
             WINDOW_CARD_BYTES.fetch_sub(self.uploaded, Ordering::Relaxed);
         }
         if let Some(card) = &mut self.card {
-            if window {
-                WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
-            } else {
-                CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
+            if self.by_address_card == 0 {
+                if window {
+                    WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+                } else {
+                    CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
+                }
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
@@ -3289,11 +3311,6 @@ impl Shadow {
         (self.start, self.len)
     }
 
-    /// The offset of a title address in the copy, if it lies in it.
-    pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
-        address.checked_sub(self.start).filter(|&at| at < self.len)
-    }
-
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
@@ -3366,6 +3383,9 @@ impl Shadow {
             window: false,
             uploaded: 0,
             place: None,
+            changes_only: AtomicBool::new(false),
+            by_address_card: 0,
+            spilled_runs: None,
         }
     }
 
@@ -3607,72 +3627,6 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
         written
-    }
-
-    /// Title memory `[address, address + len)` brought up to the copy's
-    /// bytes wherever they differ, without a snapshot (`crate::memory`:
-    /// pages shaders were seen to store to through raw addresses, a few
-    /// frames after, when their work has run). A page first learned written
-    /// was not declared when the shaders wrote it, and declaring it later
-    /// snapshots the copy, which already holds those bytes: the compare then
-    /// finds nothing and they never reached title memory (rt-datapath audit
-    /// finding 1). None (nothing done) for a copy in place or in the card's
-    /// memory, or while a declared range overlaps (its copy-back is coming);
-    /// else the bytes written.
-    /// shortcut: a title write to those bytes that landed after the shaders'
-    /// is overwritten (no snapshot tells the two apart); for the structure
-    /// builder's output the title does not write there.
-    pub(crate) fn pull_back(&self, address: u64, len: u64) -> Option<usize> {
-        if self.place.is_some() || self.card.is_some() {
-            return None;
-        }
-        let (from, to) = self.inside(address as usize, len as usize);
-        if from >= to {
-            return Some(0);
-        }
-        let start = self.start as usize;
-        if self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .any(|&(a, b)| a < start + to && b > start + from)
-        {
-            return None;
-        }
-        let mut title = vec![0u8; to - from];
-        if !crate::host::read_into((start + from) as *const u8, &mut title) {
-            return None;
-        }
-        // SAFETY: inside the copy's mapping; read only (shaders of a later
-        // flight may be writing it: what they write is pulled next time).
-        let copy = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
-        const CHUNK: usize = 256;
-        let mut written = 0;
-        let mut at = 0;
-        while at < to - from {
-            let n = CHUNK.min(to - from - at);
-            if copy[at..at + n] != title[at..at + n] {
-                // A run of differing chunks, written at once.
-                let mut end = at + n;
-                while end < to - from {
-                    let m = CHUNK.min(to - from - end);
-                    if copy[end..end + m] == title[end..end + m] {
-                        break;
-                    }
-                    end += m;
-                }
-                let dst = start + from + at;
-                crate::host::shaders_write(dst, &copy[at..end]);
-                crate::watch::writing(dst, end - at);
-                crate::host::write_mapped(dst as *mut u8, copy[at..].as_ptr(), end - at);
-                written += end - at;
-                at = end;
-            } else {
-                at += n;
-            }
-        }
-        Some(written)
     }
 
     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
@@ -4202,6 +4156,37 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        if let Some(runs) = &self.spilled_runs {
+            let taken = std::mem::take(&mut *runs.lock().unwrap_or_else(|e| e.into_inner()));
+            if taken.is_empty() {
+                return 0;
+            }
+            let max_len = self.len as usize;
+            let merged = joined(
+                taken
+                    .into_iter()
+                    .filter_map(|(a, b)| {
+                        let a = a.min(max_len);
+                        let b = b.min(max_len);
+                        (a < b).then_some((a, b))
+                    })
+                    .collect(),
+            );
+            let mut copied = 0usize;
+            for (a, b) in merged {
+                let n = b - a;
+                // SAFETY: `a..b` lies inside `[0, self.len]` of both the CPU backing
+                // buffer at `self.start` and the single PC-RAM buffer at `self.data`.
+                crate::host::copy_mapped(
+                    unsafe { self.data.add(a) },
+                    (self.start as usize + a) as *const u8,
+                    n,
+                    false,
+                );
+                copied += n;
+            }
+            return copied;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4466,8 +4451,13 @@ impl Shadow {
         let _reads_as = crate::backreads::reading_as(crate::backreads::REFRESH, self.id);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        if self.card.is_some() && from < to && copy_changed() && self.copy_changed(from, to) {
-            return to - from;
+        if self.card.is_some() && from < to {
+            if self.changes_only.load(Ordering::Relaxed) {
+                return self.copy_dwords_changed(from, to);
+            }
+            if copy_changed() && self.copy_changed(from, to) {
+                return to - from;
+            }
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
@@ -4475,6 +4465,40 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        to - from
+    }
+
+    /// Dword-granularity differential copy for VRAM-backed copies that also
+    /// receive undeclared GPU stores (`by_address`, `keep_stores`): only
+    /// dwords that changed relative to `Card::staging` are written and queued
+    /// for upload, so neighbouring GPU-written dwords in VRAM stay intact.
+    fn copy_dwords_changed(&self, from: usize, to: usize) -> usize {
+        thread_local! {
+            static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            if buf.len() < PAGE {
+                buf.resize(PAGE, 0);
+            }
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - at % PAGE).min(to - at);
+                let src = &mut buf[..n];
+                crate::host::copy_mapped(src.as_mut_ptr(), at as *const u8, n, false);
+                // SAFETY: `at..at+n` lies inside `[self.start, self.start + self.len)`.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
+                let runs = diff_dword_runs(at, src, held);
+                let base = at - start;
+                for (off, rlen) in runs {
+                    held[off..off + rlen].copy_from_slice(&src[off..off + rlen]);
+                    self.changed(base + off, base + off + rlen);
+                    self.card_changed(base + off, base + off + rlen);
+                }
+                at += n;
+            }
+        });
         to - from
     }
 
@@ -4530,6 +4554,53 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Whether shaders read this copy from PC system memory (over PCIe)
+    /// rather than local VRAM.
+    pub(crate) fn is_in_pc_ram(&self) -> bool {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_CUSTOM, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_MEMORY_POOL_L1,
+        };
+        let mut props = D3D12_HEAP_PROPERTIES::default();
+        // SAFETY: `self.buffer` is a live committed or placed D3D12 buffer.
+        unsafe { self.buffer.GetHeapProperties(Some(&mut props), None) }.is_ok()
+            && props.Type != D3D12_HEAP_TYPE_DEFAULT
+            && !(props.Type == D3D12_HEAP_TYPE_CUSTOM
+                && props.MemoryPoolPreference == D3D12_MEMORY_POOL_L1)
+    }
+
+    /// Whether this copy is a spilled [`by_address`] arena backed by a single
+    /// PC-RAM buffer without duplicate staging.
+    pub(crate) fn is_spilled_arena(&self) -> bool {
+        self.spilled_runs.is_some()
+    }
+
+    /// Marks this copy so future refreshes upload only dwords that changed
+    /// relative to the CPU side, preserving undeclared GPU stores.
+    pub(crate) fn keep_stores(&self) {
+        self.changes_only.store(true, Ordering::Relaxed);
+    }
+
+    /// Marks offsets `[from, to)` to be uploaded whole on the next submission
+    /// (for VRAM copies via `card_changed`; for spilled arenas via
+    /// `spilled_runs` without touching neighbouring GPU-written dwords).
+    pub(crate) fn resend(&self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        if self.card.is_some() {
+            self.card_changed(from, to);
+        } else if let Some(runs) = &self.spilled_runs {
+            let mut list = runs.lock().unwrap_or_else(|e| e.into_inner());
+            match list.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => {
+                    *last = (last.0.min(from), last.1.max(to));
+                }
+                _ => list.push((from, to)),
+            }
+        }
     }
 
     /// Whether this is title memory in place (`crate::inplace`), not a copy.
@@ -5359,6 +5430,155 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
         .min()
 }
 
+/// Whether `[address, address + len)` lies within a single registered title
+/// buffer; returns `(start, len)`.
+pub(crate) fn in_buffer(address: u64, len: u64) -> Option<(u64, u64)> {
+    let end = address.checked_add(len)?;
+    let map = buffers();
+    let found = map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end);
+    found.map(|(k, e)| (k.0, e.end - k.0))
+}
+
+/// Whether any registered title buffer of at most `most` bytes overlaps
+/// `[address, address + len)`.
+pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
+    let map = buffers();
+    map.range((address.saturating_sub(most), 0)..(address.saturating_add(len), 0))
+        .any(|(key, entry)| entry.end > address && entry.end - key.0 <= most)
+}
+
+/// Contiguous byte runs `(offset, len)` where `src` differs from `held`,
+/// aligned to 4-byte dwords (respecting `at & 3` prefix/suffix alignment).
+fn diff_dword_runs(at: usize, src: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+    let n = src.len().min(held.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |from: usize, len: usize| match runs.last_mut() {
+        Some((a, m)) if *a + *m == from => *m += len,
+        _ => runs.push((from, len)),
+    };
+    let prefix = ((4 - (at & 3)) & 3).min(n);
+    if prefix > 0 && src[..prefix] != held[..prefix] {
+        push(0, prefix);
+    }
+    let aligned_end = prefix + ((n - prefix) & !3);
+    let mut i = prefix;
+    while i + 4 <= aligned_end {
+        if src[i..i + 4] != held[i..i + 4] {
+            push(i, 4);
+        }
+        i += 4;
+    }
+    if aligned_end < n && src[aligned_end..n] != held[aligned_end..n] {
+        push(aligned_end, n - aligned_end);
+    }
+    runs
+}
+
+/// VRAM cap for raw-address directory and arena copies
+/// (`VICTORY_MEMORY_CARD_MB`; default 4096 MiB).
+fn by_address_card_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_MEMORY_CARD_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        mb.unwrap_or(4096) << 20
+    })
+}
+
+/// Allocates a host copy of `[start, start + len)` for raw-address memory
+/// ([`crate::memory`]: the 16 MiB directory, 64 MiB page arenas, or 64 KiB
+/// small-buffer windows).
+///
+/// Prefers VRAM (`uav_buffer`) so ray traversal reads L2/VRAM instead of PCIe
+/// system RAM. When DXGI VRAM usage is near the 97% ceiling, unpinned textures
+/// are evicted in LRU order before giving up VRAM. If VRAM is still
+/// unavailable, falls back to a **single** `shared_buffer` with `card = None`
+/// (zero duplicate staging buffer and zero PC-to-PC copy).
+pub(crate) fn by_address(start: u64, len: u64, arena: bool) -> Option<Arc<Shadow>> {
+    by_address_inner(start, len, arena, true)
+}
+
+fn by_address_inner(start: u64, len: u64, arena: bool, allow_vram: bool) -> Option<Arc<Shadow>> {
+    let host = host()?;
+    let most = by_address_card_most();
+    let mut on_card = None;
+    if allow_vram && cards() && host.card_ready() {
+        let has_room = |h: &crate::host::Host| {
+            h.video_memory()
+                .is_none_or(|[budget, used, ..]| budget == 0 || used.saturating_add(len) < budget / 100 * 97)
+        };
+        let mut room = has_room(host);
+        if !room {
+            crate::resource::evict_lru_textures(len);
+            room = has_room(host);
+        }
+        if room {
+            let prev = BY_ADDRESS_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+            if prev.saturating_add(len) <= most {
+                if let Some(vram) = host.uav_buffer(len) {
+                    on_card = Some(vram);
+                } else {
+                    BY_ADDRESS_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+                }
+            } else {
+                BY_ADDRESS_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+            }
+        }
+    }
+    if let Some(vram) = on_card {
+        let Some((staging, data)) = host.shared_buffer(len) else {
+            BY_ADDRESS_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+            return None;
+        };
+        crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, CPU staging"));
+        crate::host::name(&vram, || format!("title memory {start:#x}+{len:#x} by address, VRAM"));
+        // Tracked exclusively in `BY_ADDRESS_CARD_BYTES` so RT arenas do not
+        // exhaust `WINDOW_CARD_BYTES` (`VICTORY_CARD_WINDOWS_MB`) for non-RT windows.
+        // SAFETY: `vram` is a live committed buffer.
+        let gpu = unsafe { vram.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(vram, data, gpu, start, len);
+        shadow.window = true;
+        shadow.changes_only.store(true, Ordering::Relaxed);
+        shadow.by_address_card = len;
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::default(),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            patch: Mutex::default(),
+            size: len,
+            me: std::sync::OnceLock::new(),
+        });
+        let shadow = Arc::new(shadow);
+        if let Some(card) = &shadow.card {
+            let _ = card.me.set(Arc::downgrade(&shadow));
+            CARDED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Arc::downgrade(&shadow));
+        }
+        return Some(shadow);
+    }
+    // Spilled to PC system RAM: allocate ONE shared_buffer directly with
+    // `card: None` (never a redundant second 64 MiB staging buffer).
+    let (buffer, data) = host.shared_buffer(len)?;
+    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address, system RAM"));
+    // SAFETY: `buffer` is a live committed buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.window = true;
+    shadow.changes_only.store(true, Ordering::Relaxed);
+    if arena {
+        shadow.spilled_runs = Some(Mutex::default());
+    }
+    Some(Arc::new(shadow))
+}
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
@@ -5769,6 +5989,230 @@ mod card_merge_tests {
             // Cut on pieces of title memory: each ends on a piece or at the range's end.
             assert!((start as usize + a + n).is_multiple_of(super::PIECE) || a + n == LEN, "{a:#x}+{n:#x}");
         }
+    }
+
+    #[test]
+    fn diff_dword_runs_handles_alignment_and_merges_adjacent() {
+        assert!(super::diff_dword_runs(0, &[0u8; 16], &[0u8; 16]).is_empty());
+        let mut src = vec![0u8; 32];
+        let held = vec![0u8; 32];
+        // Adjacent dwords at 4..12 coalesce into one run; isolated dword at 20..24 stays separate.
+        src[5] = 0x11;
+        src[10] = 0x22;
+        src[23] = 0x33;
+        assert_eq!(super::diff_dword_runs(0, &src, &held), vec![(4, 8), (20, 4)]);
+        // Unaligned base (`at & 3 == 2`): prefix is 2 bytes, then 4-byte dwords, then 2-byte tail.
+        let mut a = vec![0u8; 12];
+        let b = vec![0u8; 12];
+        a[1] = 1;
+        a[10] = 2;
+        assert_eq!(super::diff_dword_runs(2, &a, &b), vec![(0, 2), (10, 2)]);
+    }
+
+    #[test]
+    fn by_address_vram_preserves_gpu_stores_and_reads_back_bit_exact() {
+        use std::sync::atomic::Ordering;
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !super::cards() || !host.card_ready() {
+            return;
+        }
+        const LEN: usize = 256 << 10;
+        let backing = crate::upload::reserve(LEN).expect("reserve low-40-bit write-watched buffer");
+        let win_before = super::WINDOW_CARD_BYTES.load(Ordering::Relaxed);
+        let by_addr_before = super::BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed);
+        let shadow = super::by_address(backing as u64, LEN as u64, true).expect("by_address VRAM arena");
+        if shadow.is_in_pc_ram() {
+            crate::upload::release(backing);
+            // Adapter VRAM budget already full; covered by the explicit spill test below.
+            return;
+        }
+        assert!(shadow.carded(), "VRAM by_address copy should use card staging");
+        assert!(!shadow.is_spilled_arena(), "VRAM by_address copy must not take spilled path");
+        assert_eq!(
+            super::WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+            win_before,
+            "by_address VRAM allocation must not consume WINDOW_CARD_BYTES"
+        );
+        assert_eq!(
+            super::BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed),
+            by_addr_before + LEN as u64,
+            "by_address VRAM allocation must account in BY_ADDRESS_CARD_BYTES"
+        );
+
+        // Write initial pattern in page 0 on CPU.
+        let cpu = backing as *mut u32;
+        // SAFETY: `backing` holds `LEN` committed bytes.
+        unsafe {
+            cpu.add(0).write_volatile(0x1122_3344);
+            cpu.add(32).write_volatile(0x5566_7788);
+            cpu.add(33).write_volatile(0x99AA_BBCC);
+        }
+
+        // Upload initial contents via a host list submission.
+        let list1 = host.new_list().expect("list1");
+        shadow.refresh(&list1, backing as u64, LEN as u64);
+        list1.close();
+        host.execute(&[&list1]);
+        crate::host::settle_now(0);
+
+        // Compile a tiny compute shader that writes GPU-side BVH dwords at byte offsets 128..136.
+        const GPU_WRITE_HLSL: &str = r#"
+RWByteAddressBuffer arena : register(u0);
+[RootSignature("UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() {
+    arena.Store(128, 0xCAFEBABEu);
+    arena.Store(132, 0x0BADF00Du);
+}
+"#;
+        let code = crate::host::compile(
+            GPU_WRITE_HLSL,
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_1"),
+        )
+        .expect("compile test UAV write shader");
+        // SAFETY: valid compiled root signature and compute shader bytecode.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("root");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("pso");
+            (root, pso)
+        };
+
+        // Run GPU write into VRAM arena at dword offsets 32 and 33 (bytes 128, 132).
+        let list2 = host.new_list().expect("list2");
+        // SAFETY: open list, live resources; COMMON implicitly promotes to UAV and decays back.
+        unsafe {
+            list2.list.SetComputeRootSignature(&root);
+            list2.list.SetPipelineState(&pso);
+            list2.list.SetComputeRootUnorderedAccessView(0, shadow.buffer.GetGPUVirtualAddress());
+            list2.list.Dispatch(1, 1, 1);
+        }
+        list2.close();
+        host.execute(&[&list2]);
+        crate::host::settle_now(0);
+
+        // Mutate ONLY dword 0 on the same 64 KiB CPU page; GPU stores at 128..136 MUST survive.
+        // SAFETY: inside `backing`.
+        unsafe { cpu.add(0).write_volatile(0xDEAD_BEEF) };
+        let (readback, rb_ptr) = host.shared_buffer(256).expect("readback buffer");
+        let list3 = host.new_list().expect("list3");
+        shadow.refresh(&list3, backing as u64, LEN as u64);
+        // SAFETY: open list; `shadow.buffer` starts COMMON, decays back after execution.
+        unsafe {
+            list3.list.CopyBufferRegion(&readback, 0, &shadow.buffer, 0, 256);
+        }
+        list3.close();
+        host.execute(&[&list3]);
+        crate::host::settle_now(0);
+
+        // SAFETY: `rb_ptr` maps 256 bytes and GPU finished.
+        let rb = unsafe { std::slice::from_raw_parts(rb_ptr.cast::<u32>(), 64) };
+        assert_eq!(rb[0], 0xDEAD_BEEF, "changed CPU dword must reach VRAM");
+        assert_eq!(rb[32], 0xCAFE_BABE, "GPU-written dword 32 must not be clobbered by page refresh");
+        assert_eq!(rb[33], 0x0BAD_F00D, "GPU-written dword 33 must not be clobbered by page refresh");
+
+        // Explicit `resend(128, 136)` (re-streamed packed structure with unchanged CPU bytes)
+        // must overwrite VRAM with CPU staging bytes bit-exact.
+        shadow.resend(128, 136);
+        let list4 = host.new_list().expect("list4");
+        shadow.refresh(&list4, backing as u64, LEN as u64);
+        // SAFETY: open list; live buffers.
+        unsafe {
+            list4.list.CopyBufferRegion(&readback, 0, &shadow.buffer, 0, 256);
+        }
+        list4.close();
+        host.execute(&[&list4]);
+        crate::host::settle_now(0);
+
+        // SAFETY: `rb_ptr` maps 256 bytes and GPU finished.
+        let rb = unsafe { std::slice::from_raw_parts(rb_ptr.cast::<u32>(), 64) };
+        assert_eq!(rb[0], 0xDEAD_BEEF);
+        assert_eq!(rb[32], 0x5566_7788, "resend must re-upload CPU bytes even when unchanged");
+        assert_eq!(rb[33], 0x99AA_BBCC, "resend must re-upload CPU bytes even when unchanged");
+
+        drop(list1);
+        drop(list2);
+        drop(list3);
+        drop(list4);
+        drop(shadow);
+        assert_eq!(
+            super::BY_ADDRESS_CARD_BYTES.load(Ordering::Relaxed),
+            by_addr_before,
+            "dropping VRAM by_address copy must decrement BY_ADDRESS_CARD_BYTES"
+        );
+        assert_eq!(
+            super::WINDOW_CARD_BYTES.load(Ordering::Relaxed),
+            win_before,
+            "dropping VRAM by_address copy must not disturb WINDOW_CARD_BYTES"
+        );
+        crate::upload::release(backing);
+    }
+
+    #[test]
+    fn by_address_spilled_avoids_duplicate_staging_and_preserves_gpu_writes() {
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        const LEN: usize = 256 << 10;
+        let backing = crate::upload::reserve(LEN).expect("reserve backing");
+        let shadow = super::by_address_inner(backing as u64, LEN as u64, true, false)
+            .expect("spilled by_address arena");
+        assert!(!shadow.carded(), "spilled by_address must NOT allocate duplicate Card::staging");
+        assert!(shadow.is_in_pc_ram(), "spilled by_address must reside in PC RAM");
+        assert!(shadow.is_spilled_arena(), "spilled arena must track exact byte runs");
+
+        let cpu = backing as *mut u32;
+        let gpu_buf = shadow.data.cast::<u32>();
+        // SAFETY: both `backing` and `shadow.data` cover `LEN` bytes.
+        unsafe {
+            cpu.add(0).write_volatile(0x1010_2020);
+            cpu.add(32).write_volatile(0x3030_4040);
+            cpu.add(33).write_volatile(0x5050_6060);
+        }
+        shadow.resend(0, 64 << 10);
+        assert_eq!(shadow.update(backing, LEN), 64 << 10);
+        // SAFETY: inside `shadow.data`.
+        unsafe {
+            assert_eq!(gpu_buf.add(0).read(), 0x1010_2020);
+            assert_eq!(gpu_buf.add(32).read(), 0x3030_4040);
+            // Simulate GPU-built BVH dwords written directly into the single PC-RAM buffer.
+            gpu_buf.add(32).write_volatile(0xAAAA_BBBB);
+            gpu_buf.add(33).write_volatile(0xCCCC_DDDD);
+            // Mutate only dword 0 on CPU and queue only that 4-byte run.
+            cpu.add(0).write_volatile(0x7777_8888);
+        }
+        shadow.resend(0, 4);
+        assert_eq!(shadow.update(backing, LEN), 4);
+        // SAFETY: inside `shadow.data`.
+        unsafe {
+            assert_eq!(gpu_buf.add(0).read(), 0x7777_8888, "changed CPU dword must copy to PC-RAM arena");
+            assert_eq!(gpu_buf.add(32).read(), 0xAAAA_BBBB, "spilled update must preserve GPU dword 32");
+            assert_eq!(gpu_buf.add(33).read(), 0xCCCC_DDDD, "spilled update must preserve GPU dword 33");
+        }
+        // Re-sending packed range `128..136` overwrites only that exact slice.
+        shadow.resend(128, 136);
+        assert_eq!(shadow.update(backing, LEN), 8);
+        // SAFETY: inside `shadow.data`.
+        unsafe {
+            assert_eq!(gpu_buf.add(0).read(), 0x7777_8888);
+            assert_eq!(gpu_buf.add(32).read(), 0x3030_4040);
+            assert_eq!(gpu_buf.add(33).read(), 0x5050_6060);
+        }
+        drop(shadow);
+        crate::upload::release(backing);
     }
 }
 

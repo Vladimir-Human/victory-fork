@@ -1880,6 +1880,111 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Selects candidate indices in oldest-used-first (LRU) order until their
+/// cumulative bytes reach `need_bytes`. Pure helper for deterministic testing.
+#[cfg(windows)]
+fn select_lru_evictions(candidates: &[(usize, u64, u64)], need_bytes: u64) -> Vec<usize> {
+    if need_bytes == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<(u64, usize, u64)> = candidates
+        .iter()
+        .map(|&(id, used, bytes)| (used, id, bytes))
+        .collect();
+    order.sort_unstable_by_key(|&(used, id, _)| (used, id));
+    let mut picked = Vec::new();
+    let mut freed = 0u64;
+    for (_, id, bytes) in order {
+        picked.push(id);
+        freed = freed.saturating_add(bytes);
+        if freed >= need_bytes {
+            break;
+        }
+    }
+    picked
+}
+
+/// Evicts unpinned, title-filled host textures in LRU order until at least
+/// `need_bytes` of VRAM are reclaimed (used before raw-address directory or
+/// BVH arena allocations fall back from VRAM to system RAM). Keeps textures
+/// touched within the last four frames so concurrent recording threads cannot
+/// race on an unattached handle. Only textures with sole ownership
+/// (`Arc::strong_count == 1` and COM refcount `== 1`, meaning no command list,
+/// descriptor slot, or in-flight submission references them) are evicted and
+/// dropped synchronously outside the `TEXTURES` lock so DXGI VRAM is reclaimed
+/// immediately before re-checking headroom. Returns bytes evicted.
+#[cfg(windows)]
+pub(crate) fn evict_lru_textures(need_bytes: u64) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    const GUARD_FRAMES: u64 = 4;
+    if need_bytes == 0 {
+        return 0;
+    }
+    let mut to_drop = Vec::new();
+    let (mut went, mut bytes) = (0u64, 0u64);
+    {
+        let all = textures();
+        let mut candidates: Vec<(usize, u64, u64)> = Vec::new();
+        for &at in all.iter() {
+            // SAFETY: textures leave the table under this lock before being freed.
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(at) {
+                continue;
+            }
+            let used = r.host.used.load(Relaxed);
+            if !crate::host::long_ago(used, 0, GUARD_FRAMES) {
+                continue;
+            }
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((host, _)) = made.as_ref()
+                && std::sync::Arc::strong_count(host) == 1
+                && crate::host::references(&host.texture) == 1
+            {
+                candidates.push((at, used, host.bytes));
+            }
+        }
+        let picked = select_lru_evictions(&candidates, need_bytes);
+        for at in picked {
+            // SAFETY: `all` lock is still held, so `at` remains valid.
+            let r = unsafe { &*(at as *const Resource) };
+            let gone = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let idle = made.as_ref().is_some_and(|(host, _)| {
+                    crate::host::long_ago(r.host.used.load(Relaxed), 0, GUARD_FRAMES)
+                        && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                });
+                if idle {
+                    crate::texture::unstage(at as This);
+                    made.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((host, _)) = gone {
+                r.host.gone.store(true, Relaxed);
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+                went += 1;
+                bytes = bytes.saturating_add(host.bytes);
+                to_drop.push(host);
+            }
+        }
+    }
+    // Release D3D12 COM objects synchronously outside `TEXTURES` lock so DXGI
+    // `QueryVideoMemoryInfo` reflects reclaimed VRAM immediately on re-check.
+    drop(to_drop);
+    if went > 0 {
+        tracing::info!(
+            went,
+            reclaimed_mb = bytes >> 20,
+            needed_mb = need_bytes >> 20,
+            "evicted unpinned textures in LRU order synchronously to keep raw-address memory in VRAM"
+        );
+    }
+    bytes
+}
+
 /// For the memory line: the host copies the sweep never lets go
 /// ([`let_go_idle`] takes only copies of textures the title fills that the
 /// host never copied into), by what would say they are dead weight. A
@@ -4313,5 +4418,23 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn select_lru_evictions_picks_oldest_until_need_met() {
+        let candidates = [
+            (10, 500, 16 << 20),
+            (20, 100, 32 << 20),
+            (30, 300, 32 << 20),
+            (40, 200, 16 << 20),
+        ];
+        assert!(select_lru_evictions(&candidates, 0).is_empty());
+        // Oldest first: 20 (32 MiB), then 40 (16 MiB) => 48 MiB >= 40 MiB.
+        assert_eq!(select_lru_evictions(&candidates, 40 << 20), vec![20, 40]);
+        // Need 64 MiB: 20 (32) + 40 (16) + 30 (32) => 80 MiB >= 64 MiB.
+        assert_eq!(select_lru_evictions(&candidates, 64 << 20), vec![20, 40, 30]);
+        // Larger than total pool evicts all candidates in LRU order.
+        assert_eq!(select_lru_evictions(&candidates, 256 << 20), vec![20, 40, 30, 10]);
     }
 }
