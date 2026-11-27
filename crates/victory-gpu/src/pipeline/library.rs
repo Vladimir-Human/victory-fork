@@ -203,20 +203,46 @@ enum Blob {
 impl Blob {
     /// The library file in `dir`: a library a save left beside it
     /// ([`NEXT_FILE`]) takes its place first.
+    #[cfg(test)]
     fn of(dir: &std::path::Path) -> Blob {
-        let path = dir.join(LIBRARY_FILE);
-        let next = dir.join(NEXT_FILE);
+        Blob::of_files(dir, &LibraryFiles::legacy()).0
+    }
+
+    /// Opens the adapter-scoped library file described by `files` in `dir`,
+    /// promoting any pending `.next` file first. Returns `(blob, from_legacy)`
+    /// where `from_legacy` is `true` if the bytes came read-only from the
+    /// legacy unsuffixed [`LIBRARY_FILE`] because this adapter had no keyed
+    /// file yet.
+    fn of_files(dir: &std::path::Path, files: &LibraryFiles) -> (Blob, bool) {
+        let path = dir.join(&files.bin);
+        let next = dir.join(&files.next);
         if next.exists() && std::fs::rename(&next, &path).is_err() {
-            tracing::warn!("the host pipeline library saved last could not take the old one's place");
+            tracing::warn!(
+                file = %files.bin,
+                "the host pipeline library saved last could not take the old one's place"
+            );
         }
+        if let Some(blob) = Blob::open_path(&path) {
+            return (blob, false);
+        }
+        if files.legacy_fallback && !path.exists() && !next.exists() {
+            let legacy = dir.join(LIBRARY_FILE);
+            if let Some(blob) = Blob::open_path(&legacy) {
+                return (blob, true);
+            }
+        }
+        (Blob::None, false)
+    }
+
+    fn open_path(path: &std::path::Path) -> Option<Blob> {
         if mapped()
-            && let Some(file) = Mapped::open(&path)
+            && let Some(file) = Mapped::open(path)
         {
-            return Blob::Mapped(file);
+            return Some(Blob::Mapped(file));
         }
-        match std::fs::read(&path) {
-            Ok(bytes) if !bytes.is_empty() => Blob::Held(bytes),
-            _ => Blob::None,
+        match std::fs::read(path) {
+            Ok(bytes) if !bytes.is_empty() => Some(Blob::Held(bytes)),
+            _ => None,
         }
     }
 
@@ -304,7 +330,8 @@ pub(crate) fn removal_note() -> String {
             );
         }
     }
-    let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
+    let at = VIEW[0].load(Ordering::Acquire);
+    let len = VIEW[1].load(Ordering::Relaxed);
     if at == 0 {
         text.push_str("; its file is not mapped");
         return text;
@@ -364,7 +391,8 @@ pub(crate) fn removal_note() -> String {
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
 pub(crate) fn trim() {
     static ON: OnceLock<bool> = OnceLock::new();
-    let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
+    let at = VIEW[0].load(Ordering::Acquire);
+    let len = VIEW[1].load(Ordering::Relaxed);
     if at == 0
         || TRIMMED.load(Ordering::Relaxed)
         || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
@@ -392,10 +420,103 @@ pub(crate) fn trim() {
     }
 }
 
+/// Stable identity of the host D3D12 adapter, used to separate on-disk
+/// pipeline libraries across adapters (e.g. hardware GPU vs software WARP or
+/// another GPU) without encoding per-boot LUIDs or driver versions that would
+/// orphan old caches on driver updates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdapterKey {
+    vendor: u32,
+    device: u32,
+    revision: u32,
+    software: bool,
+}
+
+impl AdapterKey {
+    fn slug(self) -> String {
+        format!(
+            "{:04x}-{:04x}-r{:02x}-{}",
+            self.vendor,
+            self.device,
+            self.revision,
+            if self.software { "sw" } else { "hw" },
+        )
+    }
+}
+
+/// Queries the adapter identity (`VendorId`, `DeviceId`, `Revision`, software
+/// flag) behind `device`. Returns `None` if DXGI cannot enumerate the LUID.
+fn adapter_key(device: &ID3D12Device1) -> Option<AdapterKey> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
+        IDXGIFactory4,
+    };
+    // SAFETY: plain DXGI query for the device's own adapter LUID.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).ok()?;
+        let desc = adapter.GetDesc1().ok()?;
+        Some(AdapterKey {
+            vendor: desc.VendorId,
+            device: desc.DeviceId,
+            revision: desc.Revision,
+            software: desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        })
+    }
+}
+
+/// Filenames inside the pipeline cache folder for one adapter's library.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LibraryFiles {
+    bin: String,
+    next: String,
+    tmp: String,
+    rejected: String,
+    /// Whether an existing legacy unsuffixed `host-pipelines.bin` may be read
+    /// (read-only) when this adapter has no keyed file yet. Disabled for
+    /// software adapters so WARP never reads or maps a hardware cache.
+    legacy_fallback: bool,
+}
+
+impl LibraryFiles {
+    fn legacy() -> Self {
+        Self {
+            bin: LIBRARY_FILE.to_owned(),
+            next: NEXT_FILE.to_owned(),
+            tmp: "host-pipelines.tmp".to_owned(),
+            rejected: REJECTED_FILE.to_owned(),
+            legacy_fallback: false,
+        }
+    }
+
+    fn for_adapter(key: Option<AdapterKey>) -> Self {
+        match key {
+            Some(k) => {
+                let slug = k.slug();
+                Self {
+                    bin: format!("host-pipelines-{slug}.bin"),
+                    next: format!("host-pipelines-{slug}.next"),
+                    tmp: format!("host-pipelines-{slug}.tmp"),
+                    rejected: format!("host-pipelines-{slug}.rejected.bin"),
+                    legacy_fallback: !k.software,
+                }
+            }
+            None => Self::legacy(),
+        }
+    }
+}
+
 struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
     _blob: Blob,
+    /// Adapter-scoped filenames this library saves to.
+    files: LibraryFiles,
+    /// Whether `_blob` was opened read-only from legacy [`LIBRARY_FILE`] rather
+    /// than `files.bin` (saving writes `files.bin`, leaving the mapped legacy
+    /// file unreplaced).
+    from_legacy: bool,
     /// Pipelines stored since the last save.
     added: AtomicU64,
     /// Stores share it and a save takes it alone: the size the library
@@ -451,9 +572,7 @@ fn library() -> Option<&'static Library> {
                 tracing::info!("RenderDoc is loaded: the host pipeline library is neither read nor saved in this run");
                 return None;
             }
-            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
-            let library = open(&device, blob);
+            let library = open_from_disk();
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
@@ -462,9 +581,39 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+fn open_from_disk() -> Option<Library> {
+    let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+    let files = LibraryFiles::for_adapter(adapter_key(&device));
+    let (blob, from_legacy) = DIR
+        .get()
+        .map_or((Blob::None, false), |d| Blob::of_files(d, &files));
+    let lib = open_with(&device, blob, files, from_legacy)?;
+    let bytes = lib._blob.bytes().len();
+    if bytes > 0 {
+        BLOB.store(bytes as u64, Ordering::Relaxed);
+    }
+    if let Blob::Mapped(file) = &lib._blob {
+        VIEW[1].store(file.len, Ordering::Relaxed);
+        LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+        TRIMMED.store(false, Ordering::Relaxed);
+        VIEW[0].store(file.at.Value as usize, Ordering::Release);
+    }
+    Some(lib)
+}
+
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
+#[cfg(test)]
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+    open_with(device, blob, LibraryFiles::legacy(), false)
+}
+
+fn open_with(
+    device: &ID3D12Device1,
+    blob: Blob,
+    files: LibraryFiles,
+    from_legacy: bool,
+) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
@@ -476,27 +625,35 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
         match make(blob.bytes()) {
             Ok(library) => {
                 let bytes = blob.bytes().len();
-                BLOB.store(bytes as u64, Ordering::Relaxed);
-                tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
-                if let Blob::Mapped(file) = &blob {
-                    VIEW[1].store(file.len, Ordering::Relaxed);
-                    VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
-                    LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
-                }
+                tracing::info!(
+                    bytes,
+                    file = %files.bin,
+                    from_legacy,
+                    mapped = matches!(blob, Blob::Mapped(_)),
+                    "host pipeline library loaded"
+                );
                 return Some(Library {
                     library,
                     _blob: blob,
+                    files,
+                    from_legacy,
                     added: AtomicU64::new(0),
                     saving: RwLock::new(()),
                 });
             }
             Err(e) => {
                 rejected = true;
-                tracing::warn!(error = %e, "host pipeline library rejected; starting an empty one (the rejected file is kept as {REJECTED_FILE})");
+                tracing::warn!(
+                    error = %e,
+                    file = %files.bin,
+                    from_legacy,
+                    rejected = %files.rejected,
+                    "host pipeline library rejected; starting an empty one"
+                );
             }
         }
     } else {
-        tracing::info!("no host pipeline library yet; starting an empty one");
+        tracing::info!(file = %files.bin, "no host pipeline library yet; starting an empty one");
     }
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
@@ -505,15 +662,22 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // run's first save: a refusal may be this device's alone (run 263:
     // RenderDoc's device refused the card's library, an empty one was
     // saved over 366 MB of built pipelines, and the next run drew black
-    // until they were built again).
-    if rejected && let Some(dir) = DIR.get()
-        && let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
-            tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
-        }
+    // until they were built again). When the rejected blob came from the
+    // read-only legacy fallback (`from_legacy`), leave legacy untouched for
+    // other adapters.
+    if rejected
+        && !from_legacy
+        && let Some(dir) = DIR.get()
+        && let Err(e) = std::fs::rename(dir.join(&files.bin), dir.join(&files.rejected))
+    {
+        tracing::warn!(error = %e, file = %files.bin, "the rejected host pipeline library could not be kept under its other name");
+    }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
         _blob: Blob::None,
+        files,
+        from_legacy: false,
         added: AtomicU64::new(0),
         saving: RwLock::new(()),
     })
@@ -604,26 +768,30 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+    let tmp = dir.join(&library.files.tmp);
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = {
+    let (bytes, write_early) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if !used_changed && added == 0 {
             return;
         }
-        if added == 0 {
+        let bytes = if added == 0 {
             0
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
             if let Err(e) = serialise(&library.library, &tmp, size) {
+                if used_changed {
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                }
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
                 return;
@@ -631,36 +799,62 @@ pub(crate) fn save(now: bool) {
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
             size
-        }
+        };
+        (bytes, used_changed)
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
-    if bytes > 0 && library_written.is_ok() {
-        // In place unless the system refused and the new one waits beside it.
-        let in_place = !dir.join(NEXT_FILE).exists();
-        if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
+    let library_written = if bytes > 0 {
+        replace_library_files(dir, &tmp, &library.files)
+    } else {
+        Ok(false)
+    };
+    if bytes > 0
+        && let Ok(in_place) = library_written
+    {
+        if in_place && !library.from_legacy && VIEW[0].load(Ordering::Acquire) != 0 {
             REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
         }
         crate::host::trail(|| {
             format!(
-                "pipeline library: saved {bytes} bytes, {}",
-                if in_place { "renamed over the library's file" } else { "left beside the library's file for the next start" }
+                "pipeline library ({}): saved {bytes} bytes, {}",
+                library.files.bin,
+                if in_place {
+                    "renamed over the library's file"
+                } else {
+                    "left beside the library's file for the next start"
+                }
             )
         });
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    let library_written = library_written.map(|_| ());
+    // Only rewrite `early-pipelines.txt` when this run actually recorded new
+    // used title pipelines; offline precompilation leaves `USED` untouched and
+    // must preserve any existing early list on disk.
+    let (early_count, written) = if write_early {
+        let used: Vec<String> = used().iter().flatten().cloned().collect();
+        let len = used.len();
+        let res = library_written
+            .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        (len, res)
+    } else {
+        let len = USED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, HashSet::len);
+        (len, library_written)
+    };
     match written {
         Ok(()) => tracing::info!(
             bytes,
-            early = used.len(),
+            file = %library.files.bin,
+            early = early_count,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => tracing::warn!(error = %e, file = %library.files.bin, "host pipeline library not saved"),
     }
 }
 
@@ -688,9 +882,25 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// the mapping goes on reading the old one for as long as a handle on it
 /// is open ([`holds`]; with none, only the pages in memory at that moment
 /// stay: the rest read as zeros). Where a system refuses, the new library
-/// is left beside it as [`NEXT_FILE`] for the next start.
+/// is left beside it as `.next` for the next start.
+///
+/// Returns `Ok(true)` if renamed in place over `files.bin`, `Ok(false)` if
+/// left beside it as `files.next`.
+fn replace_library_files(
+    dir: &std::path::Path,
+    tmp: &std::path::Path,
+    files: &LibraryFiles,
+) -> std::io::Result<bool> {
+    if std::fs::rename(tmp, dir.join(&files.bin)).is_ok() {
+        Ok(true)
+    } else {
+        std::fs::rename(tmp, dir.join(&files.next)).map(|()| false)
+    }
+}
+
+#[cfg(test)]
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    replace_library_files(dir, tmp, &LibraryFiles::legacy()).map(|_| ())
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -860,5 +1070,309 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    #[test]
+    fn adapter_keys_produce_distinct_filenames_for_hardware_and_software() {
+        let nv = AdapterKey {
+            vendor: 0x10de,
+            device: 0x2783,
+            revision: 0xa1,
+            software: false,
+        };
+        let warp = AdapterKey {
+            vendor: 0x1414,
+            device: 0x008c,
+            revision: 0x00,
+            software: true,
+        };
+        let nv_files = LibraryFiles::for_adapter(Some(nv));
+        let warp_files = LibraryFiles::for_adapter(Some(warp));
+        let fallback_files = LibraryFiles::for_adapter(None);
+
+        assert_eq!(nv_files.bin, "host-pipelines-10de-2783-ra1-hw.bin");
+        assert_eq!(nv_files.next, "host-pipelines-10de-2783-ra1-hw.next");
+        assert_eq!(nv_files.tmp, "host-pipelines-10de-2783-ra1-hw.tmp");
+        assert_eq!(nv_files.rejected, "host-pipelines-10de-2783-ra1-hw.rejected.bin");
+        assert!(nv_files.legacy_fallback);
+
+        assert_eq!(warp_files.bin, "host-pipelines-1414-008c-r00-sw.bin");
+        assert_eq!(warp_files.next, "host-pipelines-1414-008c-r00-sw.next");
+        assert_eq!(warp_files.tmp, "host-pipelines-1414-008c-r00-sw.tmp");
+        assert_eq!(warp_files.rejected, "host-pipelines-1414-008c-r00-sw.rejected.bin");
+        assert!(!warp_files.legacy_fallback);
+
+        assert_ne!(nv_files.bin, warp_files.bin);
+        assert_ne!(nv_files.next, warp_files.next);
+        assert_ne!(nv_files.tmp, warp_files.tmp);
+
+        assert_eq!(fallback_files.bin, LIBRARY_FILE);
+        assert_eq!(fallback_files.next, NEXT_FILE);
+        assert_eq!(fallback_files.rejected, REJECTED_FILE);
+        assert!(!fallback_files.legacy_fallback);
+
+        let spoofed_sw = AdapterKey {
+            software: true,
+            ..nv
+        };
+        assert_ne!(
+            LibraryFiles::for_adapter(Some(nv)).bin,
+            LibraryFiles::for_adapter(Some(spoofed_sw)).bin
+        );
+    }
+
+    #[test]
+    fn legacy_fallback_reads_hardware_cache_and_never_touches_it_on_warp() {
+        let dir = tempfile::tempdir().unwrap();
+        let hw = LibraryFiles::for_adapter(Some(AdapterKey {
+            vendor: 0x10de,
+            device: 0x2783,
+            revision: 0xa1,
+            software: false,
+        }));
+        let sw = LibraryFiles::for_adapter(Some(AdapterKey {
+            vendor: 0x1414,
+            device: 0x008c,
+            revision: 0x00,
+            software: true,
+        }));
+
+        let legacy_bytes = b"legacy-hardware-pso-blob".repeat(128);
+        std::fs::write(dir.path().join(LIBRARY_FILE), &legacy_bytes).unwrap();
+
+        let (sw_blob, sw_legacy) = Blob::of_files(dir.path(), &sw);
+        assert!(matches!(sw_blob, Blob::None));
+        assert!(!sw_legacy);
+
+        let sw_tmp = dir.path().join(&sw.tmp);
+        let sw_saved = b"warp-pso-blob".repeat(64);
+        std::fs::write(&sw_tmp, &sw_saved).unwrap();
+        assert!(replace_library_files(dir.path(), &sw_tmp, &sw).unwrap());
+        assert_eq!(std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(), legacy_bytes);
+        assert_eq!(std::fs::read(dir.path().join(&sw.bin)).unwrap(), sw_saved);
+
+        let (hw_blob, hw_legacy) = Blob::of_files(dir.path(), &hw);
+        assert!(hw_legacy);
+        assert_eq!(hw_blob.bytes(), &legacy_bytes[..]);
+        drop(hw_blob);
+
+        let hw_tmp = dir.path().join(&hw.tmp);
+        let hw_saved = b"keyed-hardware-pso-blob".repeat(96);
+        std::fs::write(&hw_tmp, &hw_saved).unwrap();
+        assert!(replace_library_files(dir.path(), &hw_tmp, &hw).unwrap());
+
+        let (hw_blob2, hw_legacy2) = Blob::of_files(dir.path(), &hw);
+        assert!(!hw_legacy2);
+        assert_eq!(hw_blob2.bytes(), &hw_saved[..]);
+        assert_eq!(std::fs::read(dir.path().join(&sw.bin)).unwrap(), sw_saved);
+        assert_eq!(std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(), legacy_bytes);
+    }
+
+    #[test]
+    fn warp_save_does_not_discard_hardware_pipeline_library() {
+        use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_12_0, ID3DBlob};
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter,
+            IDXGIAdapter1, IDXGIFactory4,
+        };
+
+        const WARP_CHILD_DIR: &str = "VICTORY_TEST_LIB_WARP_DIR";
+        const WARP_CHILD_LEGACY_DIR: &str = "VICTORY_TEST_LIB_WARP_LEGACY_DIR";
+        const PSO_NAME: &str = "adapter-key-isolation-test";
+
+        let cs = crate::host::compile(
+            "[numthreads(1, 1, 1)] void main() {}",
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_0"),
+        )
+        .expect("compile test compute shader");
+
+        let make_desc = |device: &ID3D12Device1| -> (ID3D12RootSignature, D3D12_COMPUTE_PIPELINE_STATE_DESC) {
+            let rs_desc = D3D12_ROOT_SIGNATURE_DESC::default();
+            let mut blob: Option<ID3DBlob> = None;
+            // SAFETY: empty root signature serialized and created on `device`.
+            let root: ID3D12RootSignature = unsafe {
+                D3D12SerializeRootSignature(
+                    &rs_desc,
+                    D3D_ROOT_SIGNATURE_VERSION_1,
+                    &mut blob,
+                    None,
+                )
+                .expect("serialize empty root signature");
+                let blob = blob.expect("root signature blob");
+                let bytes = std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                );
+                device
+                    .CreateRootSignature(0, bytes)
+                    .expect("create root signature")
+            };
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed pointer; caller keeps `root` alive while `desc` is used.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: cs.as_ptr().cast(),
+                    BytecodeLength: cs.len(),
+                },
+                ..Default::default()
+            };
+            (root, desc)
+        };
+
+        let store_and_save = |dir: &std::path::Path, device: &ID3D12Device1, pso_name: &str| -> LibraryFiles {
+            let files = LibraryFiles::for_adapter(adapter_key(device));
+            let (blob, from_legacy) = Blob::of_files(dir, &files);
+            let lib = open_with(device, blob, files.clone(), from_legacy).expect("open library");
+            let (_root, desc) = make_desc(device);
+            let wide = HSTRING::from(pso_name);
+            // SAFETY: valid compute pipeline description on `device`.
+            let pso: ID3D12PipelineState =
+                unsafe { device.CreateComputePipelineState(&desc) }.expect("create compute PSO");
+            // SAFETY: live PSO stored under unique name.
+            unsafe { lib.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }
+                .expect("store compute PSO");
+            let size = unsafe { lib.library.GetSerializedSize() };
+            let tmp = dir.join(&files.tmp);
+            serialise(&lib.library, &tmp, size).expect("serialise library");
+            replace_library_files(dir, &tmp, &files).expect("replace library file");
+            files
+        };
+
+        // Child process runs ONLY the WARP device so it never shares the
+        // process-wide D3D12 WARP singleton with parallel tests in the parent.
+        if let Some(warp_dir) = std::env::var_os(WARP_CHILD_DIR) {
+            let warp_dir = PathBuf::from(warp_dir);
+            let legacy_dir = PathBuf::from(
+                std::env::var_os(WARP_CHILD_LEGACY_DIR).expect("legacy dir env var"),
+            );
+            // SAFETY: plain DXGI and D3D12 device creation for an isolated child WARP device.
+            let warp_device: ID3D12Device1 = unsafe {
+                let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                else {
+                    return;
+                };
+                let Ok(adapter) = factory.EnumWarpAdapter::<IDXGIAdapter>() else {
+                    return;
+                };
+                let Ok(desc) = adapter.cast::<IDXGIAdapter1>().and_then(|a| a.GetDesc1()) else {
+                    return;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                    return;
+                }
+                let mut dev: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+                    return;
+                }
+                let Some(dev) = dev else { return };
+                let Ok(dev1) = dev.cast::<ID3D12Device1>() else {
+                    return;
+                };
+                dev1
+            };
+            let warp_key = adapter_key(&warp_device).expect("WARP adapter key");
+            assert!(warp_key.software);
+
+            let warp_files = store_and_save(&warp_dir, &warp_device, PSO_NAME);
+            assert!(warp_dir.join(&warp_files.bin).exists());
+            let (blob, from_legacy) = Blob::of_files(&warp_dir, &warp_files);
+            assert!(!from_legacy);
+            assert!(!blob.bytes().is_empty());
+            let lib = open_with(&warp_device, blob, warp_files.clone(), false).expect("reopen WARP");
+            let (_root, desc) = make_desc(&warp_device);
+            let wide = HSTRING::from(PSO_NAME);
+            // SAFETY: valid description matching the stored WARP PSO.
+            let loaded: windows::core::Result<ID3D12PipelineState> =
+                unsafe { lib.library.LoadComputePipeline(PCWSTR(wide.as_ptr()), &desc) };
+            assert!(loaded.is_ok(), "expected cached WARP PSO hit: {:?}", loaded.err());
+
+            let _ = store_and_save(&legacy_dir, &warp_device, PSO_NAME);
+            println!("WARP_FILE={}", warp_files.bin);
+            return;
+        }
+
+        let Some(hw_device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
+            return; // no host GPU here
+        };
+        let Some(hw_key) = adapter_key(&hw_device) else {
+            return;
+        };
+        if hw_key.software {
+            return; // test requires a distinct hardware adapter alongside WARP
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_dir = tempfile::tempdir().unwrap();
+
+        let hw_files = store_and_save(dir.path(), &hw_device, PSO_NAME);
+        let hw_path = dir.path().join(&hw_files.bin);
+        let hw_bytes_before = std::fs::read(&hw_path).expect("hardware library saved");
+        assert!(!hw_bytes_before.is_empty());
+
+        let legacy_path = legacy_dir.path().join(LIBRARY_FILE);
+        std::fs::write(&legacy_path, &hw_bytes_before).unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pipeline::library::tests::warp_save_does_not_discard_hardware_pipeline_library",
+                "--nocapture",
+            ])
+            .env(WARP_CHILD_DIR, dir.path())
+            .env(WARP_CHILD_LEGACY_DIR, legacy_dir.path())
+            .output()
+            .expect("run WARP library isolation child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "WARP child failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        let Some(warp_bin) = stdout.lines().find_map(|l| l.strip_prefix("WARP_FILE=")) else {
+            return; // WARP adapter unavailable on this host
+        };
+        let warp_path = dir.path().join(warp_bin);
+        assert_ne!(hw_path, warp_path);
+        assert!(warp_path.exists());
+
+        let hw_bytes_after = std::fs::read(&hw_path).expect("hardware library still present");
+        assert_eq!(hw_bytes_before, hw_bytes_after);
+
+        let (blob, from_legacy) = Blob::of_files(dir.path(), &hw_files);
+        assert!(!from_legacy);
+        assert!(!blob.bytes().is_empty());
+        let lib = open_with(&hw_device, blob, hw_files.clone(), false).expect("reopen hardware");
+        let (_root, desc) = make_desc(&hw_device);
+        let wide = HSTRING::from(PSO_NAME);
+        // SAFETY: valid description matching the stored hardware PSO.
+        let loaded: windows::core::Result<ID3D12PipelineState> =
+            unsafe { lib.library.LoadComputePipeline(PCWSTR(wide.as_ptr()), &desc) };
+        assert!(
+            loaded.is_ok(),
+            "expected cached hardware PSO hit for {}: {:?}",
+            hw_files.bin,
+            loaded.err()
+        );
+
+        assert_eq!(
+            std::fs::read(&legacy_path).unwrap(),
+            hw_bytes_before,
+            "WARP must never overwrite legacy host-pipelines.bin"
+        );
+        let (hw_legacy_blob, used_legacy) = Blob::of_files(legacy_dir.path(), &hw_files);
+        assert!(used_legacy);
+        let hw_legacy_lib =
+            open_with(&hw_device, hw_legacy_blob, hw_files.clone(), true).expect("open legacy");
+        let (_root, desc) = make_desc(&hw_device);
+        // SAFETY: valid description matching the stored hardware PSO.
+        let loaded: windows::core::Result<ID3D12PipelineState> =
+            unsafe { hw_legacy_lib.library.LoadComputePipeline(PCWSTR(wide.as_ptr()), &desc) };
+        assert!(
+            loaded.is_ok(),
+            "hardware should load existing legacy host-pipelines.bin seamlessly"
+        );
     }
 }

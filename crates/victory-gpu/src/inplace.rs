@@ -746,6 +746,110 @@ struct Own {
 /// host refused the view (not asked again).
 static OWN: Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> = Mutex::new(None);
 
+/// Stores `bytes` into our persistent writable mapping of `section` (size
+/// `section_bytes`) at byte `offset` (within one 64 KiB block). Leaf lock
+/// (`OWN` only, never touches `VIEWS` or title VAs), so safe to invoke from
+/// lazy VEH / demand materialization before flipping `PAGE_NOACCESS` ->
+/// `PAGE_READWRITE` with zero per-page `MapViewOfFile`/`UnmapViewOfFile`
+/// syscalls or TLB shootdowns.
+pub(crate) fn write_section_own(section: usize, section_bytes: u64, offset: u64, bytes: &[u8]) -> bool {
+    if bytes.is_empty() || offset.saturating_add(bytes.len() as u64) > section_bytes {
+        return false;
+    }
+    let first_block = (offset as usize) / K64;
+    let last_block = (offset as usize + bytes.len()).div_ceil(K64);
+    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(view) = own
+        .get_or_insert_with(Default::default)
+        .entry(section)
+        .or_insert_with(|| {
+            // SAFETY: a section handle the runtime gave us, alive as long
+            // as the title's views of it are; the view is ours and stays.
+            let at = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, 0) };
+            if at.Value.is_null() {
+                tracing::warn!(
+                    section,
+                    error = %std::io::Error::last_os_error(),
+                    "no view of our own on a section of title pages: what shaders wrote goes back the old way there"
+                );
+                return None;
+            }
+            tracing::info!(
+                section,
+                mb = section_bytes >> 20,
+                "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
+            );
+            Some(Own {
+                base: at.Value as usize,
+                bytes: section_bytes,
+                committed: vec![0; (section_bytes as usize).div_ceil(K64).div_ceil(64)],
+            })
+        })
+        .as_mut()
+    else {
+        return false;
+    };
+    if offset.saturating_add(bytes.len() as u64) > view.bytes {
+        return false;
+    }
+    for block in first_block..last_block {
+        if (view.committed[block / 64] & (1u64 << (block % 64))) == 0 {
+            // The title's view committed these pages of the section; asked
+            // once more through ours, which changes nothing if they are.
+            // SAFETY: a block inside our own view.
+            let there = unsafe {
+                mem::VirtualAlloc((view.base + block * K64) as *const c_void, K64, mem::MEM_COMMIT, mem::PAGE_READWRITE)
+            };
+            if there.is_null() {
+                return false;
+            }
+            view.committed[block / 64] |= 1u64 << (block % 64);
+        }
+    }
+    // SAFETY: committed bytes inside our own view; the source is the
+    // caller's slice.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view.base + offset as usize) as *mut u8, bytes.len()) };
+    true
+}
+
+/// Classification of a 64 KiB page in `inplace::views` for lazy copy-back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageViewInfo {
+    /// Not tracked in `inplace::views` (`MEM_PRIVATE` or unregistered view).
+    Unknown,
+    /// Backed by a section mapped into more than one title view (must not arm).
+    Aliased,
+    /// Single-view `MEM_MAPPED` section page: `(section, offset, section_bytes)`.
+    Single(usize, u64, u64),
+}
+
+/// Classifies a batch of 64 KiB page-aligned title addresses under ONE `VIEWS` lock.
+pub(crate) fn single_view_pages_batch(page_addrs: &[usize]) -> Vec<PageViewInfo> {
+    let v = views();
+    if v.views.is_empty() {
+        return vec![PageViewInfo::Unknown; page_addrs.len()];
+    }
+    let mut out = Vec::with_capacity(page_addrs.len());
+    for &page_addr in page_addrs {
+        let info = (|| {
+            let (&base, &(bytes, section, offset)) = v.views.range(..=page_addr).next_back()?;
+            let within = page_addr.checked_sub(base)?;
+            if within + K64 > bytes || !within.is_multiple_of(K64) {
+                return None;
+            }
+            let sec_off = offset + within as u64;
+            let shown = v.pages.get(&(section, sec_off))?;
+            if shown.len() > 1 {
+                return Some(PageViewInfo::Aliased);
+            }
+            let sec_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+            Some(PageViewInfo::Single(section, sec_off, sec_bytes))
+        })();
+        out.push(info.unwrap_or(PageViewInfo::Unknown));
+    }
+    out
+}
+
 /// Stores `bytes` at title address `at` through a view of our own
 /// ([`back_own`]), if `[at, at + bytes.len())` lies in one 64 KiB page of
 /// a title view of a section. Gives the addresses of that page in every
@@ -773,57 +877,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
         (section, offset, shown, section_bytes)
     };
-    if offset + bytes.len() as u64 > section_bytes {
-        return None;
-    }
-    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
-    let view = own
-        .get_or_insert_with(Default::default)
-        .entry(section)
-        .or_insert_with(|| {
-            // SAFETY: a section handle the runtime gave us, alive as long
-            // as the title's views of it are; the view is ours and stays.
-            let at = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, 0) };
-            if at.Value.is_null() {
-                tracing::warn!(
-                    section,
-                    error = %std::io::Error::last_os_error(),
-                    "no view of our own on a section of title pages: what shaders wrote goes back the old way there"
-                );
-                return None;
-            }
-            tracing::info!(
-                section,
-                mb = section_bytes >> 20,
-                "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
-            );
-            Some(Own {
-                base: at.Value as usize,
-                bytes: section_bytes,
-                committed: vec![0; (section_bytes as usize).div_ceil(K64).div_ceil(64)],
-            })
-        })
-        .as_mut()?;
-    if offset + bytes.len() as u64 > view.bytes {
-        return None;
-    }
-    let block = offset as usize / K64;
-    if (view.committed[block / 64] & (1u64 << (block % 64))) == 0 {
-        // The title's view committed these pages of the section; asked
-        // once more through ours, which changes nothing if they are.
-        // SAFETY: a block inside our own view.
-        let there = unsafe {
-            mem::VirtualAlloc((view.base + block * K64) as *const c_void, K64, mem::MEM_COMMIT, mem::PAGE_READWRITE)
-        };
-        if there.is_null() {
-            return None;
-        }
-        view.committed[block / 64] |= 1u64 << (block % 64);
-    }
-    // SAFETY: committed bytes inside our own view; the source is the
-    // caller's slice.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view.base + offset as usize) as *mut u8, bytes.len()) };
-    Some(shown)
+    write_section_own(section, section_bytes, offset, bytes).then_some(shown)
 }
 
 /// How the views cover `[at, at + len)`.

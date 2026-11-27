@@ -15,14 +15,755 @@
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
+
+/// Inline-first buffer for coalesced dirty page runs produced by
+/// [`CopiedPages::plan_stale`]: avoids heap allocation for up to 8 runs per
+/// refresh (the overwhelming majority of refreshes).
+struct SmallRuns {
+    inline: [(usize, usize); 8],
+    inline_len: usize,
+    spill: Vec<(usize, usize)>,
+}
+
+impl SmallRuns {
+    fn new() -> Self {
+        Self {
+            inline: [(0, 0); 8],
+            inline_len: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, from: usize, to: usize) {
+        if self.inline_len < self.inline.len() {
+            self.inline[self.inline_len] = (from, to);
+            self.inline_len += 1;
+        } else {
+            self.spill.push((from, to));
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.inline[..self.inline_len]
+            .iter()
+            .copied()
+            .chain(self.spill.iter().copied())
+    }
+}
+
+/// Per-page last copied write-watch sequence, paired with a 64-page-per-word
+/// bitmask of uncopied pages so partially-initialized buffers and windows
+/// still hit the O(1)/O(|written|) fast path on initialized subranges and skip
+/// initialized regions 64 pages at a time when uncopied pages exist.
+struct CopiedPages {
+    at: Vec<u64>,
+    /// Bit `i` (word `i / 64`, bit `i % 64`) is 1 iff `at[i] == 0`.
+    /// Unused high bits in the final word are always 0.
+    uncopied_bits: Vec<u64>,
+    uncopied: usize,
+}
+
+impl CopiedPages {
+    fn new(pages: usize) -> Self {
+        let words = pages.div_ceil(64);
+        let mut uncopied_bits = vec![u64::MAX; words];
+        let rem = pages % 64;
+        if rem != 0 {
+            uncopied_bits[words - 1] = (1u64 << rem) - 1;
+        }
+        Self {
+            at: vec![0; pages],
+            uncopied_bits,
+            uncopied: pages,
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<u64> {
+        self.at.get(index).copied()
+    }
+
+    fn set(&mut self, index: usize, now: u64) {
+        if let Some(slot) = self.at.get_mut(index) {
+            if *slot == 0 && now != 0 {
+                self.uncopied -= 1;
+                self.uncopied_bits[index / 64] &= !(1u64 << (index % 64));
+            } else if *slot != 0 && now == 0 {
+                self.uncopied += 1;
+                self.uncopied_bits[index / 64] |= 1u64 << (index % 64);
+            }
+            *slot = now;
+        }
+    }
+
+    #[cfg(test)]
+    fn all_copied(&self) -> bool {
+        self.uncopied == 0
+    }
+
+    /// Whether every page index in `lo..=hi` has been copied whole at least once.
+    fn range_all_copied(&self, lo: usize, hi: usize) -> bool {
+        if self.uncopied == 0 {
+            return true;
+        }
+        let first_w = lo / 64;
+        let last_w = hi / 64;
+        let lo_mask = u64::MAX << (lo % 64);
+        let hi_mask = u64::MAX >> (63 - (hi % 64));
+        if first_w == last_w {
+            return (self.uncopied_bits[first_w] & lo_mask & hi_mask) == 0;
+        }
+        if (self.uncopied_bits[first_w] & lo_mask) != 0 {
+            return false;
+        }
+        for &word in &self.uncopied_bits[first_w + 1..last_w] {
+            if word != 0 {
+                return false;
+            }
+        }
+        (self.uncopied_bits[last_w] & hi_mask) == 0
+    }
+
+    /// Lowest page index `>= from_idx` and `<= hi` that has never been copied whole.
+    fn next_uncopied(&self, from_idx: usize, hi: usize) -> Option<usize> {
+        if from_idx > hi || self.uncopied == 0 {
+            return None;
+        }
+        let mut w = from_idx / 64;
+        let last_w = hi / 64;
+        let mut word = self.uncopied_bits[w] & (u64::MAX << (from_idx % 64));
+        loop {
+            if w == last_w {
+                word &= u64::MAX >> (63 - (hi % 64));
+            }
+            if word != 0 {
+                return Some(w * 64 + word.trailing_zeros() as usize);
+            }
+            if w == last_w {
+                return None;
+            }
+            w += 1;
+            word = self.uncopied_bits[w];
+        }
+    }
+
+    /// Plans the coalesced byte ranges `[run_from, run_to)` inside `[from, to)`
+    /// that must be copied from title memory, updating whole-page copied
+    /// timestamps to `now`. Runs purely on metadata so callers can release the
+    /// `copied` mutex before invoking memory copies.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_stale(
+        &mut self,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+    ) -> SmallRuns {
+        self.plan_stale_filtered(base, start, end, from, to, now, written, |_| false)
+    }
+
+    /// Like [`Self::plan_stale`], skipping page indices for which `skip_idx`
+    /// returns `true` (used by lazy GPU-resident write-back so `DEFERRED`
+    /// pages are neither copied from title memory nor coalesced across).
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn plan_stale_filtered(
+        &mut self,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        skip_idx: impl Fn(usize) -> bool,
+    ) -> SmallRuns {
+        self.plan_stale_with_subs(base, start, end, from, to, now, written, &[], false, false, skip_idx)
+    }
+
+    /// Plans stale byte ranges with optional 4 KiB subpage narrowing
+    /// (`VICTORY_DIRTY_4K`: `subs`, `narrow`, `count_dirty4k`) and optional
+    /// lazy-held page skipping (`skip_idx`).
+    #[allow(clippy::too_many_arguments)]
+    fn plan_stale_with_subs(
+        &mut self,
+        base: usize,
+        start: usize,
+        end: usize,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        subs: &[(usize, u64, u64, u16)],
+        narrow: bool,
+        count_dirty4k: bool,
+        skip_idx: impl Fn(usize) -> bool,
+    ) -> SmallRuns {
+        const KERNEL_PAGE: usize = 4096;
+        let mut runs = SmallRuns::new();
+        if from >= to {
+            return runs;
+        }
+        let first_page = from / PAGE;
+        let last = (to - 1) / PAGE;
+        let lo = first_page - base;
+        let hi = last - base;
+
+        let mut si = if subs.len() > 8 {
+            subs.partition_point(|s| s.0 < first_page)
+        } else {
+            0
+        };
+
+        let mut emit_stale = |runs: &mut SmallRuns,
+                              run: &mut Option<(usize, usize)>,
+                              page: usize,
+                              write: u64,
+                              taken: u64| {
+            if count_dirty4k || narrow {
+                while si < subs.len() && subs[si].0 < page {
+                    si += 1;
+                }
+                let sub = (si < subs.len() && subs[si].0 == page && subs[si].1 == write && write != 0)
+                    .then(|| (subs[si].2, subs[si].3));
+                let found = sub.filter(|&(before, _)| taken != 0 && before <= taken).map(|(_, bits)| bits);
+                if count_dirty4k {
+                    crate::watch::dirty4k_count(found, narrow && found.is_some());
+                }
+                if narrow && let Some(bits) = found {
+                    if let Some((run_start, run_end)) = run.take() {
+                        runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                    }
+                    let mut k = 0;
+                    while k < PAGE / KERNEL_PAGE {
+                        if bits & (1 << k) == 0 {
+                            k += 1;
+                            continue;
+                        }
+                        let a = k;
+                        while k < PAGE / KERNEL_PAGE && bits & (1 << k) != 0 {
+                            k += 1;
+                        }
+                        let lo_b = (page * PAGE + a * KERNEL_PAGE).max(from);
+                        let hi_b = (page * PAGE + k * KERNEL_PAGE).min(to);
+                        if lo_b < hi_b {
+                            runs.push(lo_b, hi_b);
+                        }
+                    }
+                    return;
+                }
+            }
+            match *run {
+                Some((_, run_end)) if page < run_end => {}
+                Some((run_start, run_end)) if page == run_end => {
+                    *run = Some((run_start, page + 1));
+                }
+                Some((run_start, run_end)) => {
+                    runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+                    *run = Some((page, page + 1));
+                }
+                None => *run = Some((page, page + 1)),
+            }
+        };
+
+        let mut run: Option<(usize, usize)> = None;
+        let w_start = if written.len() > 8 {
+            written.partition_point(|&(p, _)| p < first_page)
+        } else {
+            0
+        };
+
+        // Fast path: every page in `[from, to)` has been initialized at least
+        // once (even if other pages of the same buffer/window have not).
+        if self.range_all_copied(lo, hi) {
+            if written.is_empty() {
+                return runs;
+            }
+            for &(page, write) in &written[w_start..] {
+                if page < first_page {
+                    continue;
+                }
+                if page > last {
+                    break;
+                }
+                let idx = page - base;
+                let taken = self.at[idx];
+                if skip_idx(idx) || write <= taken {
+                    continue;
+                }
+                // A page only partly in the range is copied in part: it stays
+                // stale for the rest.
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    self.set(idx, now);
+                }
+                emit_stale(&mut runs, &mut run, page, write, taken);
+            }
+            if let Some((run_start, run_end)) = run {
+                runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+            }
+            return runs;
+        }
+
+        // Sparse merge of uncopied pages (via 64-page bitmask) and dirty
+        // `written` entries in `[first_page, last]`, skipping already-clean
+        // initialized spans without touching `self.at`.
+        let mut wi = w_start;
+        while wi < written.len() && written[wi].0 < first_page {
+            wi += 1;
+        }
+        let mut next_u = self.next_uncopied(lo, hi);
+        loop {
+            while wi < written.len() && written[wi].0 <= last {
+                let (wp, write) = written[wi];
+                let idx = wp - base;
+                if self.at[idx] == 0 || write > self.at[idx] {
+                    break;
+                }
+                wi += 1;
+            }
+            let next_w = (wi < written.len() && written[wi].0 <= last).then(|| written[wi].0 - base);
+            let (idx, write) = match (next_u, next_w) {
+                (Some(u), Some(w)) if u < w => {
+                    next_u = self.next_uncopied(u + 1, hi);
+                    (u, 0)
+                }
+                (Some(u), Some(w)) if w < u => {
+                    let wr = written[wi].1;
+                    wi += 1;
+                    (w, wr)
+                }
+                (Some(u), Some(_)) => {
+                    let wr = written[wi].1;
+                    next_u = self.next_uncopied(u + 1, hi);
+                    wi += 1;
+                    (u, wr)
+                }
+                (Some(u), None) => {
+                    next_u = self.next_uncopied(u + 1, hi);
+                    (u, 0)
+                }
+                (None, Some(w)) => {
+                    let wr = written[wi].1;
+                    wi += 1;
+                    (w, wr)
+                }
+                (None, None) => break,
+            };
+            if skip_idx(idx) {
+                continue;
+            }
+            let taken = self.at[idx];
+            let page = base + idx;
+            if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                self.set(idx, now);
+            }
+            emit_stale(&mut runs, &mut run, page, write, taken);
+        }
+        // Cut to the range: next to it shaders may be writing the copy.
+        if let Some((run_start, run_end)) = run {
+            runs.push((run_start * PAGE).max(from), (run_end * PAGE).min(to));
+        }
+        runs
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn copied_count(&self) -> usize {
+        self.at.len() - self.uncopied
+    }
+}
+
+/// Self-contained Resizable BAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) helpers kept
+/// inside `shadow.rs` (opt-in via `VICTORY_REBAR=1|2`, default OFF).
+mod rebar {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Kind {
+        Window,
+        Buffer,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Decision {
+        Rebar,
+        Off,
+        Unsupported,
+        NotThisKind,
+        CpuRead,
+        OverBudget,
+        CardFull,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Ask {
+        pub level: u8,
+        pub supported: bool,
+        pub kind: Kind,
+        pub size: u64,
+        pub cpu_read: bool,
+        pub placed: u64,
+        pub most: u64,
+        pub card: Option<(u64, u64)>,
+    }
+
+    fn card_limit_bytes(budget: u64, percent: u64) -> u64 {
+        ((u128::from(budget) * u128::from(percent)) / 100) as u64
+    }
+
+    fn vram_percent() -> u64 {
+        static PERCENT: OnceLock<u64> = OnceLock::new();
+        *PERCENT.get_or_init(|| {
+            std::env::var("VICTORY_REBAR_VRAM_PERCENT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map_or(80, |p| p.clamp(50, 90))
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn decide(ask: &Ask) -> Decision {
+        decide_with_percent(ask, 80)
+    }
+
+    fn decide_with_percent(ask: &Ask, vram_pct: u64) -> Decision {
+        if ask.level == 0 {
+            return Decision::Off;
+        }
+        if !ask.supported {
+            return Decision::Unsupported;
+        }
+        if ask.cpu_read {
+            return Decision::CpuRead;
+        }
+        match ask.kind {
+            Kind::Window => {}
+            Kind::Buffer if ask.level >= 2 => {}
+            Kind::Buffer => return Decision::NotThisKind,
+        }
+        if ask.placed.saturating_add(ask.size) > ask.most {
+            return Decision::OverBudget;
+        }
+        if let Some((budget, used)) = ask.card
+            && used.saturating_add(ask.size) > card_limit_bytes(budget, vram_pct)
+        {
+            return Decision::CardFull;
+        }
+        Decision::Rebar
+    }
+
+    pub(super) fn level_of(value: Option<&str>) -> u8 {
+        match value.map(str::trim) {
+            Some("1") => 1,
+            Some("2") => 2,
+            _ => 0,
+        }
+    }
+
+    pub(super) fn default_most(card_budget: Option<u64>) -> u64 {
+        match card_budget {
+            Some(b) => (b / 4).min(4 << 30),
+            None => 256 << 20,
+        }
+    }
+
+    pub(super) fn level() -> u8 {
+        static LEVEL: OnceLock<u8> = OnceLock::new();
+        *LEVEL.get_or_init(|| level_of(std::env::var("VICTORY_REBAR").ok().as_deref()))
+    }
+
+    pub(super) fn supported() -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let Some(host) = crate::host::host() else {
+                return false;
+            };
+            let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: plain feature query filling our local structure.
+            let ok = unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS16,
+                        (&raw mut o16).cast(),
+                        size_of_val(&o16) as u32,
+                    )
+                    .is_ok()
+            };
+            ok && o16.GPUUploadHeapSupported.as_bool()
+        })
+    }
+
+    fn most() -> u64 {
+        static MOST: OnceLock<u64> = OnceLock::new();
+        *MOST.get_or_init(|| {
+            let env = std::env::var("VICTORY_REBAR_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            match env {
+                Some(mb) => mb.saturating_mul(1 << 20),
+                None => {
+                    let budget = crate::host::host()
+                        .and_then(|h| h.video_memory())
+                        .map(|[b, ..]| b);
+                    default_most(budget)
+                }
+            }
+        })
+    }
+
+    static PLACED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+    fn reserve_bytes(placed: &AtomicU64, size: u64, most: u64) -> Option<u64> {
+        if size == 0 {
+            return None;
+        }
+        let mut used = placed.load(Ordering::Relaxed);
+        loop {
+            let next = used.checked_add(size).filter(|&n| n <= most)?;
+            match placed.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(next),
+                Err(cur) => used = cur,
+            }
+        }
+    }
+
+    fn reserve_with_card(
+        placed: &AtomicU64,
+        in_flight: &AtomicU64,
+        size: u64,
+        most: u64,
+        card: Option<(u64, u64)>,
+        vram_pct: u64,
+    ) -> Option<u64> {
+        if size == 0 {
+            return None;
+        }
+        let Some((budget, used)) = card else {
+            let next = reserve_bytes(placed, size, most)?;
+            in_flight.fetch_add(size, Ordering::Release);
+            return Some(next);
+        };
+        let limit = card_limit_bytes(budget, vram_pct);
+        let mut cur = in_flight.load(Ordering::Acquire);
+        loop {
+            let effective_used = used.checked_add(cur)?;
+            let next_used = effective_used.checked_add(size)?;
+            if next_used > limit {
+                return None;
+            }
+            let next = cur + size;
+            match in_flight.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        match reserve_bytes(placed, size, most) {
+            Some(next) => Some(next),
+            None => {
+                in_flight.fetch_sub(size, Ordering::Release);
+                None
+            }
+        }
+    }
+
+    pub(super) struct Reservation {
+        size: u64,
+        committed: bool,
+    }
+
+    impl Reservation {
+        pub(super) fn commit(mut self) -> u64 {
+            self.committed = true;
+            IN_FLIGHT.fetch_sub(self.size, Ordering::Release);
+            self.size
+        }
+    }
+
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            if !self.committed {
+                IN_FLIGHT.fetch_sub(self.size, Ordering::Release);
+                released(self.size);
+            }
+        }
+    }
+
+    pub(super) fn reserve(kind: Kind, size: u64, cpu_read: bool) -> Option<Reservation> {
+        let level = level();
+        if size == 0 || level == 0 || !supported() || cpu_read {
+            return None;
+        }
+        if matches!(kind, Kind::Buffer) && level < 2 {
+            return None;
+        }
+        let most = most();
+        let placed = PLACED[0].load(Ordering::Relaxed);
+        if placed.saturating_add(size) > most {
+            PLACED[2].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let card = crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[b, u, ..]| (b, u));
+        let vram_pct = vram_percent();
+        let ask = Ask {
+            level,
+            supported: true,
+            kind,
+            size,
+            cpu_read,
+            placed,
+            most,
+            card: card.map(|(b, u)| (b, u.saturating_add(IN_FLIGHT.load(Ordering::Acquire)))),
+        };
+        let reserved = match decide_with_percent(&ask, vram_pct) {
+            Decision::Rebar => reserve_with_card(&PLACED[0], &IN_FLIGHT, size, most, card, vram_pct),
+            Decision::OverBudget | Decision::CardFull => None,
+            _ => return None,
+        };
+        if reserved.is_none() {
+            PLACED[2].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        PLACED[1].fetch_add(1, Ordering::Relaxed);
+        Some(Reservation {
+            size,
+            committed: false,
+        })
+    }
+
+    pub(super) fn released(size: u64) {
+        PLACED[0].fetch_sub(size, Ordering::Relaxed);
+        PLACED[1].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn gpu_upload_buffer(
+        host: &crate::host::Host,
+        size: u64,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and persistent mapping of a GPU upload buffer.
+        let made = unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no GPU upload buffer (ReBAR)");
+                None
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+
+        #[test]
+        fn rebar_decisions_and_concurrent_headroom_hold() {
+            let mut ask = Ask {
+                level: 1,
+                supported: true,
+                kind: Kind::Window,
+                size: 4 * MIB,
+                cpu_read: false,
+                placed: 0,
+                most: GIB,
+                card: Some((12 * GIB, 2 * GIB)),
+            };
+            assert_eq!(decide(&ask), Decision::Rebar);
+            ask.kind = Kind::Buffer;
+            assert_eq!(decide(&ask), Decision::NotThisKind);
+            ask.level = 2;
+            assert_eq!(decide(&ask), Decision::Rebar);
+            ask.cpu_read = true;
+            assert_eq!(decide(&ask), Decision::CpuRead);
+
+            let placed = AtomicU64::new(512 * MIB);
+            let in_flight = AtomicU64::new(0);
+            let budget = 12 * GIB;
+            let used = card_limit_bytes(budget, 80) - 4 * MIB;
+            let gate = std::sync::Barrier::new(8);
+            let accepted = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            gate.wait();
+                            reserve_with_card(&placed, &in_flight, 4 * MIB, 2 * GIB, Some((budget, used)), 80)
+                        })
+                    })
+                    .collect();
+                workers.into_iter().filter_map(|w| w.join().unwrap()).count()
+            });
+            assert_eq!(accepted, 1);
+            assert_eq!(placed.load(Ordering::Relaxed), 516 * MIB);
+            assert_eq!(in_flight.load(Ordering::Relaxed), 4 * MIB);
+            assert_eq!(card_limit_bytes(105, 80), 84);
+        }
+    }
+}
+
+/// Per-page lazy GPU-resident state on a `Shadow`.
+const LAZY_EAGER: u8 = 0;
+const LAZY_DEFERRED: u8 = 1;
+const LAZY_FLUSHING: u8 = 2;
+const LAZY_RESYNC: u8 = 3;
+const LAZY_HOT: u8 = 4;
+const LAZY_INELIGIBLE: u8 = 5;
+
+#[inline]
+fn is_lazy_held(state: u8) -> bool {
+    state == LAZY_DEFERRED || state == LAZY_FLUSHING
+}
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -33,13 +774,17 @@ pub(crate) struct Shadow {
     start: u64,
     len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
-    /// after which it was last copied (0: never).
-    copied: Mutex<Vec<u64>>,
+    /// after which it was last copied (0: never), indexed with a 64-page
+    /// uncopied bitmask for O(dirty) `copy_stale`.
+    copied: Mutex<CopiedPages>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free mirror of `!pending.is_empty()` so read-only windows and
+    /// buffers skip acquiring `pending` on every refresh and flight check.
+    has_pending: AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -74,12 +819,35 @@ pub(crate) struct Shadow {
     /// A window whose one buffer is in a GPU upload heap ([`window_upload`]):
     /// its bytes, counted with the windows on the card.
     uploaded: u64,
+    /// Bytes reserved in ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`); 0 when in system RAM or carded.
+    rebar: u64,
+    /// Per 64 KiB page lazy GPU-resident state (`LAZY_EAGER`..`LAZY_INELIGIBLE`),
+    /// read/updated lock-free so VEH never acquires any `Shadow` mutex.
+    lazy_state: Vec<AtomicU8>,
+    /// Per 64 KiB page consecutive flush strikes within the hot-page window.
+    lazy_strikes: Vec<AtomicU8>,
+    /// Last frame at which each 64 KiB page was flushed/released.
+    lazy_last_flush_frame: Vec<AtomicU32>,
+    /// Frame until which a hot or transient-ineligible page stays skipped
+    /// (`u32::MAX` denotes permanently ineligible).
+    lazy_cool_until: Vec<AtomicU32>,
+    /// Number of 64 KiB pages currently `LAZY_DEFERRED` or `LAZY_FLUSHING`.
+    deferred_count: AtomicUsize,
+    /// Number of 64 KiB pages currently `LAZY_RESYNC` (flushed by VEH, pending
+    /// staging/hash resync on the next GPU use).
+    resync_count: AtomicUsize,
+    /// Latest `Host::fence` value signalled after an async GPU write to this
+    /// shadow (`Host::submit` `late` path), used lock-free by `LazyReadback`
+    /// to synchronize cross-queue reads without ever locking `host.submitted`.
+    last_write_fence: AtomicU64,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    #[cfg(test)]
+    lazy_opted_in: bool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -97,6 +865,10 @@ struct Card {
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free mirror of `!dirty.is_empty()`; cleared only after `sent` and
+    /// `has_sent` have been updated so concurrent `card_merge_relay` readers
+    /// observing `has_dirty == false` are guaranteed to observe `has_sent == true`.
+    has_dirty: AtomicBool,
     /// With [`relay`]: the offsets that went from `dirty` to the card's
     /// side, each with the number of the send that took it
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
@@ -108,6 +880,13 @@ struct Card {
     /// copies of their runs ([`Shadow::merge_under_writes`]). Locked inside
     /// `dirty`'s lock, `sent` inside it.
     patch: Mutex<Patch>,
+    /// Lock-free mirror of `!patch.words.is_empty()`, cleared only after `sent`
+    /// and `has_sent` are updated so concurrent `card_merge_relay` never misses
+    /// ranges transitioning from `patch` to `sent`.
+    has_patch: AtomicBool,
+    /// Lock-free mirror of `!sent.is_empty()` so clean carded copies skip
+    /// locking `sent` on every submission.
+    has_sent: AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
     /// The copy itself, for [`CHANGED`]: set once it is shared.
@@ -838,10 +1617,14 @@ pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Ve
         let Some(c) = shadow.card.as_ref() else {
             continue;
         };
+        if !c.has_patch.load(Ordering::Acquire) {
+            continue;
+        }
         let taken = {
             let _dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let mut patch = c.patch.lock().unwrap_or_else(|e| e.into_inner());
             if patch.words.is_empty() {
+                c.has_patch.store(false, Ordering::Release);
                 continue;
             }
             let taken = std::mem::take(&mut *patch);
@@ -849,7 +1632,9 @@ pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Ve
                 let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                 sent.retain(|s| s.2 > fetched);
                 sent.extend(taken.ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                c.has_sent.store(!sent.is_empty(), Ordering::Release);
             }
+            c.has_patch.store(false, Ordering::Release);
             taken
         };
         // The runs are only hashed again (`Host::card_before`): lean, one
@@ -865,14 +1650,33 @@ pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Ve
 /// ([`card_dirty`]); with [`relay`] they are noted as sent, and the notes of
 /// sends that every fetch still to be merged came after (`fetched`) go.
 fn take_dirty(c: &Card, fetched: u64, sent_as: u64) -> Vec<(usize, usize)> {
-    let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-    let ranges = std::mem::take(&mut *dirty);
-    if relay() {
+    let relay_on = relay();
+    let has_dirty = c.has_dirty.load(Ordering::Acquire);
+    let has_sent = relay_on && c.has_sent.load(Ordering::Acquire);
+    if !has_dirty && !has_sent {
+        return Vec::new();
+    }
+    if has_dirty {
+        let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let ranges = std::mem::take(&mut *dirty);
+        if relay_on {
+            let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+            sent.retain(|s| s.2 > fetched);
+            sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+            // Publish `has_sent` BEFORE clearing `has_dirty` so a concurrent
+            // `card_merge_relay` checking `has_dirty` then `has_sent` never
+            // observes both false while a range is transitioning.
+            c.has_sent.store(!sent.is_empty(), Ordering::Release);
+        }
+        c.has_dirty.store(false, Ordering::Release);
+        ranges
+    } else {
+        // Only pruning stale `sent` entries (respects `dirty` -> `sent` lock order).
         let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
         sent.retain(|s| s.2 > fetched);
-        sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+        c.has_sent.store(!sent.is_empty(), Ordering::Release);
+        Vec::new()
     }
-    ranges
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -1202,6 +2006,208 @@ impl Flights {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_avx2() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
+}
+
+/// Drains write-combining buffers after sequential CPU stores into a ReBAR
+/// (`D3D12_HEAP_TYPE_GPU_UPLOAD`) mapping so subsequent reads or GPU work
+/// observe the completed writes in order.
+#[inline]
+fn wc_sfence() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SFENCE is part of baseline SSE2 on every x86-64 CPU.
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
+    }
+}
+
+/// Copies `len` bytes from write-combined (USWC) memory (`src`, e.g. a ReBAR
+/// `D3D12_HEAP_TYPE_GPU_UPLOAD` mapping) into cached system memory (`dst`).
+/// Uses AVX2 `VMOVNTDQA` streaming loads on 32-byte aligned addresses bracketed
+/// by `_mm_mfence()` so streaming loads cannot bypass prior same-core WC stores
+/// or reorder past following WC stores or synchronization loads.
+///
+/// # Safety
+/// `src` must be valid for reads of `len` bytes, `dst` valid for writes of
+/// `len` bytes, and the two ranges must not overlap.
+unsafe fn copy_from_wc(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if len >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; pointer bounds guaranteed by caller.
+        unsafe { copy_from_wc_avx2(src, dst, len) };
+        return;
+    }
+    // SAFETY: caller's bounds and non-overlap guarantee.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_from_wc_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::{__m256i, _mm_mfence, _mm256_storeu_si256, _mm256_stream_load_si256};
+    struct MfenceOnExit;
+    impl Drop for MfenceOnExit {
+        #[inline]
+        fn drop(&mut self) {
+            // SAFETY: MFENCE is part of baseline SSE2 on every x86-64 CPU.
+            unsafe { _mm_mfence() };
+        }
+    }
+    // Order VMOVNTDQA after any prior same-core WC stores / sync loads, and
+    // guarantee an exit MFENCE before any following WC stores or reads.
+    _mm_mfence();
+    let _exit_fence = MfenceOnExit;
+
+    let prefix = src.align_offset(32).min(len);
+    if prefix > 0 {
+        // SAFETY: `prefix <= len`.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, prefix) };
+    }
+    let mut at = prefix;
+    while at + 256 <= len {
+        // SAFETY: `src.add(at)` is 32-byte aligned and `at + 256 <= len`.
+        unsafe {
+            let s = src.add(at);
+            let d = dst.add(at);
+            let v0 = _mm256_stream_load_si256(s.cast::<__m256i>());
+            let v1 = _mm256_stream_load_si256(s.add(32).cast::<__m256i>());
+            let v2 = _mm256_stream_load_si256(s.add(64).cast::<__m256i>());
+            let v3 = _mm256_stream_load_si256(s.add(96).cast::<__m256i>());
+            let v4 = _mm256_stream_load_si256(s.add(128).cast::<__m256i>());
+            let v5 = _mm256_stream_load_si256(s.add(160).cast::<__m256i>());
+            let v6 = _mm256_stream_load_si256(s.add(192).cast::<__m256i>());
+            let v7 = _mm256_stream_load_si256(s.add(224).cast::<__m256i>());
+            _mm256_storeu_si256(d.cast::<__m256i>(), v0);
+            _mm256_storeu_si256(d.add(32).cast::<__m256i>(), v1);
+            _mm256_storeu_si256(d.add(64).cast::<__m256i>(), v2);
+            _mm256_storeu_si256(d.add(96).cast::<__m256i>(), v3);
+            _mm256_storeu_si256(d.add(128).cast::<__m256i>(), v4);
+            _mm256_storeu_si256(d.add(160).cast::<__m256i>(), v5);
+            _mm256_storeu_si256(d.add(192).cast::<__m256i>(), v6);
+            _mm256_storeu_si256(d.add(224).cast::<__m256i>(), v7);
+        }
+        at += 256;
+    }
+    while at + 32 <= len {
+        // SAFETY: `src.add(at)` is 32-byte aligned and `at + 32 <= len`.
+        unsafe {
+            let v = _mm256_stream_load_si256(src.add(at).cast::<__m256i>());
+            _mm256_storeu_si256(dst.add(at).cast::<__m256i>(), v);
+        }
+        at += 32;
+    }
+    if at < len {
+        // SAFETY: remaining tail within `len`.
+        unsafe { std::ptr::copy_nonoverlapping(src.add(at), dst.add(at), len - at) };
+    }
+}
+
+/// Compares `len` bytes of write-combined memory (`wc_src`) against cached
+/// memory (`cached`) using AVX2 `VMOVNTDQA` streaming loads on aligned
+/// addresses bracketed by `_mm_mfence()`.
+///
+/// # Safety
+/// Both `wc_src` and `cached` must be valid for reads of `len` bytes.
+unsafe fn slices_equal_wc(wc_src: *const u8, cached: *const u8, len: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if len >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; pointer bounds guaranteed by caller.
+        return unsafe { slices_equal_wc_avx2(wc_src, cached, len) };
+    }
+    // SAFETY: caller's bounds guarantee.
+    unsafe {
+        std::slice::from_raw_parts(wc_src, len) == std::slice::from_raw_parts(cached, len)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn slices_equal_wc_avx2(wc_src: *const u8, cached: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm_mfence, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_set1_epi8, _mm256_stream_load_si256,
+    };
+    struct MfenceOnExit;
+    impl Drop for MfenceOnExit {
+        #[inline]
+        fn drop(&mut self) {
+            // SAFETY: MFENCE is part of baseline SSE2 on every x86-64 CPU.
+            unsafe { _mm_mfence() };
+        }
+    }
+    // Order VMOVNTDQA after any prior same-core WC stores / sync loads, and
+    // guarantee an exit MFENCE on every return path (including early `false`).
+    _mm_mfence();
+    let _exit_fence = MfenceOnExit;
+
+    let prefix = wc_src.align_offset(32).min(len);
+    for i in 0..prefix {
+        // SAFETY: `i < prefix <= len`.
+        if unsafe { *wc_src.add(i) != *cached.add(i) } {
+            return false;
+        }
+    }
+    let mut at = prefix;
+    const BLOCK: usize = 4096;
+    while at + 256 <= len {
+        let block_end = at.saturating_add(BLOCK).min(len - (len - at) % 256);
+        let mut acc0 = _mm256_set1_epi8(-1);
+        let mut acc1 = _mm256_set1_epi8(-1);
+        while at < block_end {
+            // SAFETY: `wc_src.add(at)` is 32-byte aligned and `at + 256 <= len`.
+            unsafe {
+                let w = wc_src.add(at);
+                let c = cached.add(at);
+                let w0 = _mm256_stream_load_si256(w.cast::<__m256i>());
+                let w1 = _mm256_stream_load_si256(w.add(32).cast::<__m256i>());
+                let w2 = _mm256_stream_load_si256(w.add(64).cast::<__m256i>());
+                let w3 = _mm256_stream_load_si256(w.add(96).cast::<__m256i>());
+                let w4 = _mm256_stream_load_si256(w.add(128).cast::<__m256i>());
+                let w5 = _mm256_stream_load_si256(w.add(160).cast::<__m256i>());
+                let w6 = _mm256_stream_load_si256(w.add(192).cast::<__m256i>());
+                let w7 = _mm256_stream_load_si256(w.add(224).cast::<__m256i>());
+                let e0 = _mm256_cmpeq_epi8(w0, _mm256_loadu_si256(c.cast::<__m256i>()));
+                let e1 = _mm256_cmpeq_epi8(w1, _mm256_loadu_si256(c.add(32).cast::<__m256i>()));
+                let e2 = _mm256_cmpeq_epi8(w2, _mm256_loadu_si256(c.add(64).cast::<__m256i>()));
+                let e3 = _mm256_cmpeq_epi8(w3, _mm256_loadu_si256(c.add(96).cast::<__m256i>()));
+                let e4 = _mm256_cmpeq_epi8(w4, _mm256_loadu_si256(c.add(128).cast::<__m256i>()));
+                let e5 = _mm256_cmpeq_epi8(w5, _mm256_loadu_si256(c.add(160).cast::<__m256i>()));
+                let e6 = _mm256_cmpeq_epi8(w6, _mm256_loadu_si256(c.add(192).cast::<__m256i>()));
+                let e7 = _mm256_cmpeq_epi8(w7, _mm256_loadu_si256(c.add(224).cast::<__m256i>()));
+                acc0 = _mm256_and_si256(acc0, _mm256_and_si256(_mm256_and_si256(e0, e1), _mm256_and_si256(e2, e3)));
+                acc1 = _mm256_and_si256(acc1, _mm256_and_si256(_mm256_and_si256(e4, e5), _mm256_and_si256(e6, e7)));
+            }
+            at += 256;
+        }
+        if _mm256_movemask_epi8(_mm256_and_si256(acc0, acc1)) != -1i32 {
+            return false;
+        }
+    }
+    while at + 32 <= len {
+        // SAFETY: `wc_src.add(at)` is 32-byte aligned and `at + 32 <= len`.
+        let eq = unsafe {
+            let w = _mm256_stream_load_si256(wc_src.add(at).cast::<__m256i>());
+            let c = _mm256_loadu_si256(cached.add(at).cast::<__m256i>());
+            _mm256_cmpeq_epi8(w, c)
+        };
+        if _mm256_movemask_epi8(eq) != -1i32 {
+            return false;
+        }
+        at += 32;
+    }
+    for i in at..len {
+        // SAFETY: `i < len`.
+        if unsafe { *wc_src.add(i) != *cached.add(i) } {
+            return false;
+        }
+    }
+    true
+}
+
 /// The relay's merge of a stretch of a copy ([`relay`]). `now` is what the
 /// card's memory holds, read once; `held` is the copy's reference for the
 /// stretch (its snapshot, or the CPU's side of a copy in the card's
@@ -1216,15 +2222,374 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let n = now.len().min(held.len()).min(title.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { merge_piece_avx2(&now[..n], &mut held[..n], &mut title[..n]) };
+    }
+    merge_piece_scalar(&now[..n], &mut held[..n], &mut title[..n])
+}
+
+fn merge_piece_scalar(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    for ((&n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+        if n != *h {
+            differs |= n ^ *t;
+            *t = n;
+            *h = n;
+        }
     }
     differs != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm256_or_si256, _mm256_setzero_si256, _mm256_storeu_si256, _mm256_testz_si256,
+        _mm256_xor_si256,
+    };
+    let n = now.len();
+    let (np, hp, tp) = (now.as_ptr(), held.as_mut_ptr(), title.as_mut_ptr());
+    let mut vdiff = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within all three slices.
+        unsafe {
+            let vn = _mm256_loadu_si256(np.add(i).cast::<__m256i>());
+            let vh = _mm256_loadu_si256(hp.add(i).cast::<__m256i>());
+            let eq = _mm256_cmpeq_epi8(vn, vh);
+            if _mm256_movemask_epi8(eq) != -1i32 {
+                let vt = _mm256_loadu_si256(tp.add(i).cast::<__m256i>());
+                let merged = _mm256_blendv_epi8(vn, vt, eq);
+                vdiff = _mm256_or_si256(vdiff, _mm256_xor_si256(merged, vt));
+                _mm256_storeu_si256(tp.add(i).cast::<__m256i>(), merged);
+                _mm256_storeu_si256(hp.add(i).cast::<__m256i>(), vn);
+            }
+        }
+        i += 32;
+    }
+    let differs = _mm256_testz_si256(vdiff, vdiff) == 0;
+    merge_piece_scalar(&now[i..], &mut held[i..], &mut title[i..]) || differs
+}
+
+/// Synchronous card-buffer copy-back merge for [`Shadow::card_merge`]: takes
+/// `gpu` where `gpu != old`, else `title`, writing merged bytes into both
+/// `title` and `old` without dirtying unchanged 32-byte vectors. Returns
+/// whether `title` changed.
+fn merge_sync_card(title: &mut [u8], gpu: &[u8], old: &mut [u8]) -> bool {
+    let n = title.len().min(gpu.len()).min(old.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { merge_sync_card_avx2(&mut title[..n], &gpu[..n], &mut old[..n]) };
+    }
+    merge_sync_card_scalar(&mut title[..n], &gpu[..n], &mut old[..n])
+}
+
+fn merge_sync_card_scalar(title: &mut [u8], gpu: &[u8], old: &mut [u8]) -> bool {
+    let mut differs = 0u8;
+    for ((t, &g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
+        if g != *o {
+            differs |= g ^ *t;
+            *t = g;
+            *o = g;
+        } else if *o != *t {
+            *o = *t;
+        }
+    }
+    differs != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_sync_card_avx2(title: &mut [u8], gpu: &[u8], old: &mut [u8]) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_or_si256, _mm256_setzero_si256, _mm256_storeu_si256,
+        _mm256_testz_si256, _mm256_xor_si256,
+    };
+    let n = title.len();
+    let (tp, gp, op) = (title.as_mut_ptr(), gpu.as_ptr(), old.as_mut_ptr());
+    let mut vdiff = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within all three slices.
+        unsafe {
+            let vt = _mm256_loadu_si256(tp.add(i).cast::<__m256i>());
+            let vg = _mm256_loadu_si256(gp.add(i).cast::<__m256i>());
+            let vo = _mm256_loadu_si256(op.add(i).cast::<__m256i>());
+            let eq_go = _mm256_cmpeq_epi8(vg, vo);
+            let eq_to = _mm256_cmpeq_epi8(vt, vo);
+            if _mm256_movemask_epi8(_mm256_and_si256(eq_go, eq_to)) != -1i32 {
+                let merged = _mm256_blendv_epi8(vg, vt, eq_go);
+                let diff_t = _mm256_xor_si256(merged, vt);
+                if _mm256_testz_si256(diff_t, diff_t) == 0 {
+                    vdiff = _mm256_or_si256(vdiff, diff_t);
+                    _mm256_storeu_si256(tp.add(i).cast::<__m256i>(), merged);
+                }
+                if _mm256_movemask_epi8(_mm256_cmpeq_epi8(merged, vo)) != -1i32 {
+                    _mm256_storeu_si256(op.add(i).cast::<__m256i>(), merged);
+                }
+            }
+        }
+        i += 32;
+    }
+    let differs = _mm256_testz_si256(vdiff, vdiff) == 0;
+    merge_sync_card_scalar(&mut title[i..], &gpu[i..], &mut old[i..]) || differs
+}
+
+/// Merges GPU-written bytes (`gpu != old && title == old`) into `title` without
+/// mutating `gpu` or `old`, recording the exact title-written runs into `runs`.
+/// Used by the WC ReBAR path of [`Shadow::copy_back_with`] so `gpu` stays
+/// intact as the baseline for [`changed_runs`] while preserving upstream #2009
+/// title-wins conflict semantics.
+fn merge_gpu_into_title_runs(
+    title: &mut [u8],
+    gpu: &[u8],
+    old: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+) -> bool {
+    runs.clear();
+    let n = title.len().min(gpu.len()).min(old.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { merge_gpu_into_title_runs_avx2(&mut title[..n], &gpu[..n], &old[..n], runs) };
+    }
+    merge_gpu_into_title_runs_scalar(&mut title[..n], &gpu[..n], &old[..n], runs)
+}
+
+fn merge_gpu_into_title_runs_scalar(
+    title: &mut [u8],
+    gpu: &[u8],
+    old: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+) -> bool {
+    let mut run_start: Option<usize> = None;
+    for (i, ((t, &g), &o)) in title.iter_mut().zip(gpu).zip(old).enumerate() {
+        if g != o && *t == o {
+            *t = g;
+            run_start.get_or_insert(i);
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, i - start));
+        }
+    }
+    if let Some(start) = run_start {
+        runs.push((start, title.len() - start));
+    }
+    !runs.is_empty()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_gpu_into_title_runs_avx2(
+    title: &mut [u8],
+    gpu: &[u8],
+    old: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_andnot_si256, _mm256_blendv_epi8, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_storeu_si256,
+    };
+    let n = title.len();
+    let (tp, gp, op) = (title.as_mut_ptr(), gpu.as_ptr(), old.as_ptr());
+    let mut run_start: Option<usize> = None;
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within all three slices.
+        let diff = unsafe {
+            let vt = _mm256_loadu_si256(tp.add(i).cast::<__m256i>());
+            let vg = _mm256_loadu_si256(gp.add(i).cast::<__m256i>());
+            let vo = _mm256_loadu_si256(op.add(i).cast::<__m256i>());
+            let eq_go = _mm256_cmpeq_epi8(vg, vo);
+            let eq_to = _mm256_cmpeq_epi8(vt, vo);
+            let gpu_wins = _mm256_andnot_si256(eq_go, eq_to);
+            let mask = _mm256_movemask_epi8(gpu_wins) as u32;
+            if mask != 0 {
+                let merged = _mm256_blendv_epi8(vt, vg, gpu_wins);
+                _mm256_storeu_si256(tp.add(i).cast::<__m256i>(), merged);
+            }
+            mask
+        };
+        if diff == 0 {
+            if let Some(start) = run_start.take() {
+                runs.push((start, i - start));
+            }
+        } else if diff == u32::MAX {
+            run_start.get_or_insert(i);
+        } else {
+            let mut pos = 0usize;
+            while pos < 32 {
+                let rem = diff >> pos;
+                if run_start.is_some() {
+                    let ones = (rem.trailing_ones() as usize).min(32 - pos);
+                    pos += ones;
+                    if pos < 32 {
+                        let start = run_start.take().expect("checked is_some above");
+                        runs.push((start, i + pos - start));
+                    }
+                } else {
+                    if rem == 0 {
+                        break;
+                    }
+                    pos += rem.trailing_zeros() as usize;
+                    run_start = Some(i + pos);
+                }
+            }
+        }
+        i += 32;
+    }
+    while i < n {
+        if gpu[i] != old[i] && title[i] == old[i] {
+            title[i] = gpu[i];
+            run_start.get_or_insert(i);
+        } else if let Some(start) = run_start.take() {
+            runs.push((start, i - start));
+        }
+        i += 1;
+    }
+    if let Some(start) = run_start {
+        runs.push((start, n - start));
+    }
+    !runs.is_empty()
+}
+
+/// Synchronous host-copy merge for [`back_piece`]: takes `host` where
+/// `host != old && title == old`, else `title`, updating both `title` and
+/// `host` without dirtying unchanged 32-byte vectors and appending the exact
+/// GPU-written runs into `runs`.
+fn merge_back_piece(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+) -> bool {
+    runs.clear();
+    let n = title.len().min(host.len()).min(old.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= n`.
+        return unsafe { merge_back_piece_avx2(&mut title[..n], &mut host[..n], &old[..n], runs) };
+    }
+    merge_back_piece_scalar(&mut title[..n], &mut host[..n], &old[..n], runs)
+}
+
+fn merge_back_piece_scalar(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+) -> bool {
+    let mut run_start: Option<usize> = None;
+    for (i, ((t, h), &o)) in title.iter_mut().zip(host.iter_mut()).zip(old).enumerate() {
+        if *h != o && *t == o {
+            *t = *h;
+            run_start.get_or_insert(i);
+        } else {
+            if *h != *t {
+                *h = *t;
+            }
+            if let Some(start) = run_start.take() {
+                runs.push((start, i - start));
+            }
+        }
+    }
+    if let Some(start) = run_start {
+        runs.push((start, title.len() - start));
+    }
+    !runs.is_empty()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_back_piece_avx2(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &[u8],
+    runs: &mut Vec<(usize, usize)>,
+) -> bool {
+    use std::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_blendv_epi8, _mm256_cmpeq_epi8,
+        _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_storeu_si256,
+    };
+    let n = title.len();
+    let (tp, hp, op) = (title.as_mut_ptr(), host.as_mut_ptr(), old.as_ptr());
+    let mut run_start: Option<usize> = None;
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within all three slices.
+        let diff = unsafe {
+            let vt = _mm256_loadu_si256(tp.add(i).cast::<__m256i>());
+            let vh = _mm256_loadu_si256(hp.add(i).cast::<__m256i>());
+            let vo = _mm256_loadu_si256(op.add(i).cast::<__m256i>());
+            let eq_ho = _mm256_cmpeq_epi8(vh, vo);
+            let eq_th = _mm256_cmpeq_epi8(vt, vh);
+            if _mm256_movemask_epi8(_mm256_and_si256(eq_ho, eq_th)) == -1i32 {
+                0u32
+            } else {
+                let eq_to = _mm256_cmpeq_epi8(vt, vo);
+                let gpu_wins = _mm256_andnot_si256(eq_ho, eq_to);
+                let mask = _mm256_movemask_epi8(gpu_wins) as u32;
+                let merged = _mm256_blendv_epi8(vt, vh, gpu_wins);
+                if mask != 0 {
+                    _mm256_storeu_si256(tp.add(i).cast::<__m256i>(), merged);
+                }
+                if _mm256_movemask_epi8(_mm256_cmpeq_epi8(merged, vh)) != -1i32 {
+                    _mm256_storeu_si256(hp.add(i).cast::<__m256i>(), merged);
+                }
+                mask
+            }
+        };
+        if diff == 0 {
+            if let Some(start) = run_start.take() {
+                runs.push((start, i - start));
+            }
+        } else if diff == u32::MAX {
+            run_start.get_or_insert(i);
+        } else {
+            let mut pos = 0usize;
+            while pos < 32 {
+                let rem = diff >> pos;
+                if run_start.is_some() {
+                    let ones = (rem.trailing_ones() as usize).min(32 - pos);
+                    pos += ones;
+                    if pos < 32 {
+                        let start = run_start.take().expect("checked is_some above");
+                        runs.push((start, i + pos - start));
+                    }
+                } else {
+                    if rem == 0 {
+                        break;
+                    }
+                    pos += rem.trailing_zeros() as usize;
+                    run_start = Some(i + pos);
+                }
+            }
+        }
+        i += 32;
+    }
+    while i < n {
+        if host[i] != old[i] && title[i] == old[i] {
+            title[i] = host[i];
+            run_start.get_or_insert(i);
+        } else {
+            if host[i] != title[i] {
+                host[i] = title[i];
+            }
+            if let Some(start) = run_start.take() {
+                runs.push((start, i - start));
+            }
+        }
+        i += 1;
+    }
+    if let Some(start) = run_start {
+        runs.push((start, n - start));
+    }
+    !runs.is_empty()
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1672,8 +3037,19 @@ fn refresh_count() -> bool {
 // Only the first or last unequal chunk needs a byte-wise search.
 const DIFF_CHUNK: usize = 32;
 
-/// Where `a` and `b` first differ within their common length.
+/// Where `a` and `b` first differ within their common length (AVX2 32 bytes at
+/// a time, falling back to chunked scalar).
 fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    let len = a.len().min(b.len());
+    #[cfg(target_arch = "x86_64")]
+    if len >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= len`.
+        return unsafe { first_difference_avx2(&a[..len], &b[..len]) };
+    }
+    first_difference_scalar(&a[..len], &b[..len])
+}
+
+fn first_difference_scalar(a: &[u8], b: &[u8]) -> Option<usize> {
     let len = a.len().min(b.len());
     let (a_chunks, a_tail) = a[..len].as_chunks::<DIFF_CHUNK>();
     let (b_chunks, b_tail) = b[..len].as_chunks::<DIFF_CHUNK>();
@@ -1684,8 +3060,41 @@ fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
     a.iter().zip(b).position(|(x, y)| x != y).map(|i| offset + i)
 }
 
-/// Where `a` and `b` last differ within their common length.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn first_difference_avx2(a: &[u8], b: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = a.len();
+    let (ap, bp) = (a.as_ptr(), b.as_ptr());
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` within both slices.
+        let mask = unsafe {
+            let va = _mm256_loadu_si256(ap.add(i).cast::<__m256i>());
+            let vb = _mm256_loadu_si256(bp.add(i).cast::<__m256i>());
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb)) as u32
+        };
+        if mask != u32::MAX {
+            return Some(i + (!mask).trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+    first_difference_scalar(&a[i..], &b[i..]).map(|off| i + off)
+}
+
+/// Where `a` and `b` last differ within their common length (AVX2 32 bytes at
+/// a time, falling back to chunked scalar).
 fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    let len = a.len().min(b.len());
+    #[cfg(target_arch = "x86_64")]
+    if len >= 32 && has_avx2() {
+        // SAFETY: AVX2 verified via `has_avx2()`; slices share length `>= len`.
+        return unsafe { last_difference_avx2(&a[..len], &b[..len]) };
+    }
+    last_difference_scalar(&a[..len], &b[..len])
+}
+
+fn last_difference_scalar(a: &[u8], b: &[u8]) -> Option<usize> {
     let len = a.len().min(b.len());
     let (a_chunks, a_tail) = a[..len].as_chunks::<DIFF_CHUNK>();
     let (b_chunks, b_tail) = b[..len].as_chunks::<DIFF_CHUNK>();
@@ -1698,6 +3107,32 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .zip(&b_chunks[chunk])
         .rposition(|(x, y)| x != y)
         .map(|i| chunk * DIFF_CHUNK + i)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn last_difference_avx2(a: &[u8], b: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = a.len();
+    let whole = n & !31;
+    if let Some(i) = a[whole..].iter().zip(&b[whole..]).rposition(|(x, y)| x != y) {
+        return Some(whole + i);
+    }
+    let (ap, bp) = (a.as_ptr(), b.as_ptr());
+    let mut i = whole;
+    while i >= 32 {
+        i -= 32;
+        // SAFETY: `i + 32 <= whole <= n` within both slices.
+        let mask = unsafe {
+            let va = _mm256_loadu_si256(ap.add(i).cast::<__m256i>());
+            let vb = _mm256_loadu_si256(bp.add(i).cast::<__m256i>());
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb)) as u32
+        };
+        if mask != u32::MAX {
+            return Some(i + 31 - (!mask).leading_zeros() as usize);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1744,33 +3179,40 @@ mod difference_tests {
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
 
-/// Copies `len` bytes, on several threads if they are many: a snapshot of
-/// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
-/// one thread copies some 8 GB/s.
+/// Copies `len` bytes, on the kept worker pool ([`wide`]) if they are many.
+/// When `src_wc` is true (`src` is write-combined ReBAR memory), uses single-
+/// threaded AVX2 `VMOVNTDQA` streaming loads bracketed by `_mm_mfence()`.
 ///
 /// # Safety
 /// Both ranges are valid for `len` bytes and do not overlap.
-unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
+unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize, src_wc: bool) {
+    if src_wc {
+        // SAFETY: caller's bounds and non-overlap guarantee.
+        unsafe { copy_from_wc(src, dst, len) };
+        return;
+    }
     const PER_THREAD: usize = 16 << 20;
     let threads = (len / PER_THREAD).clamp(1, 6);
     if threads == 1 {
-        // SAFETY: the caller's.
+        // SAFETY: caller's bounds and non-overlap guarantee.
         unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
     if kept_threads_now() {
-        let jobs: Vec<Job> = (0..threads)
-            .map(|i| {
-                let at = (i * each).min(len);
-                let n = each.min(len - at);
-                Box::new(move || {
-                    // SAFETY: a part of the caller's ranges; `wide` returns
-                    // only when every part is copied.
-                    unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
-                }) as Job
-            })
-            .collect();
+        let mut jobs: Vec<Job> = Vec::with_capacity(threads);
+        for i in 0..threads {
+            let at = (i * each).min(len);
+            let n = each.min(len - at);
+            if n == 0 {
+                continue;
+            }
+            jobs.push(Box::new(move || {
+                // SAFETY: disjoint sub-ranges within the caller's valid ranges;
+                // `wide` returns only when every part is copied.
+                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+            }));
+        }
         wide(jobs);
         return;
     }
@@ -1778,6 +3220,9 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
         for i in 0..threads {
             let at = (i * each).min(len);
             let n = each.min(len - at);
+            if n == 0 {
+                continue;
+            }
             s.spawn(move || {
                 // SAFETY: a part of the caller's ranges.
                 unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
@@ -1815,46 +3260,119 @@ pub(crate) fn wide_back() -> bool {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// Lock-free completion state for one [`wide`] batch: workers decrement `left`
+/// atomically and only lock `lock` to notify `ready` on the final job (`1 -> 0`).
+struct WideDone {
+    left: AtomicUsize,
+    lock: Mutex<()>,
+    ready: Condvar,
+    panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+impl WideDone {
+    fn finish_one(&self) {
+        if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.ready.notify_all();
+        }
+    }
+
+    fn run_job(&self, job: Job) {
+        struct FinishGuard<'a>(&'a WideDone);
+        impl Drop for FinishGuard<'_> {
+            fn drop(&mut self) {
+                self.0.finish_one();
+            }
+        }
+        let _finish = FinishGuard(self);
+        let _in_wide = InWideGuard::enter();
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+            let mut slot = self.panic.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(payload);
+            }
+        }
+    }
+
+    fn wait_and_rethrow(&self) {
+        if self.left.load(Ordering::Acquire) > 0 {
+            let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            while self.left.load(Ordering::Acquire) > 0 {
+                guard = self.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        if let Some(payload) = self.panic.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+thread_local! {
+    static IN_WIDE: Cell<bool> = const { Cell::new(false) };
+    static SCRATCH_TITLE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_WC: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static IN_LAZY_VEH: Cell<bool> = const { Cell::new(false) };
+}
+
+struct InWideGuard(bool);
+
+impl InWideGuard {
+    fn enter() -> Self {
+        let prev = IN_WIDE.with(|c| c.replace(true));
+        Self(prev)
+    }
+}
+
+impl Drop for InWideGuard {
+    fn drop(&mut self) {
+        IN_WIDE.with(|c| c.set(self.0));
+    }
+}
+
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 pub(crate) struct Workers {
-    jobs: Mutex<std::collections::VecDeque<Job>>,
-    more: std::sync::Condvar,
+    jobs: Mutex<std::collections::VecDeque<(Job, Arc<WideDone>)>>,
+    more: Condvar,
+    threads: usize,
 }
 
 fn workers() -> &'static Workers {
-    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+    static WORKERS: OnceLock<Workers> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
-    let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+    let n = std::thread::available_parallelism()
+        .map_or(4, |n| n.get() / 4)
+        .clamp(2, 6);
     kept_pool(&WORKERS, &STARTED, "victory-wide", n)
 }
 
 /// The kept threads of a pool: `n` threads named `name-i`, started once.
 fn kept_pool(
-    cell: &'static std::sync::OnceLock<Workers>,
+    cell: &'static OnceLock<Workers>,
     started: &'static std::sync::Once,
     name: &'static str,
     n: usize,
 ) -> &'static Workers {
     let workers = cell.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
-        more: std::sync::Condvar::new(),
+        more: Condvar::new(),
+        threads: n,
     });
     started.call_once(|| {
-        for i in 0..n {
+        for i in 0..workers.threads {
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
                 let workers = cell.get().expect("made above");
                 loop {
-                    let job = {
+                    let (job, done) = {
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
-                            if let Some(job) = jobs.pop_front() {
-                                break job;
+                            if let Some(item) = jobs.pop_front() {
+                                break item;
                             }
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
                         }
                     };
-                    job();
+                    done.run_job(job);
                 }
             });
         }
@@ -1868,52 +3386,51 @@ fn kept_pool(
 /// submitting thread never runs a texture's work (and its locks) inside its
 /// own [`wide`], nor waits behind it.
 pub(crate) fn ahead_workers() -> &'static Workers {
-    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+    static WORKERS: OnceLock<Workers> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
     kept_pool(&WORKERS, &STARTED, "victory-ahead", 7)
 }
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
-/// of them are done. The jobs copy and compare memory; they do not panic.
+/// of them are done. Any panic in a job is propagated without deadlocking.
 fn wide(jobs: Vec<Job>) {
     wide_in(workers(), jobs);
 }
 
 /// [`wide`] on the pool `workers`.
 fn wide_in(workers: &'static Workers, jobs: Vec<Job>) {
-    if jobs.len() < 2 {
+    if jobs.len() < 2 || IN_WIDE.with(Cell::get) {
         for job in jobs {
             job();
         }
         return;
     }
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let count = jobs.len();
+    let done = Arc::new(WideDone {
+        left: AtomicUsize::new(count),
+        lock: Mutex::new(()),
+        ready: Condvar::new(),
+        panic: Mutex::new(None),
+    });
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
-            let left = left.clone();
-            queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
-            }));
+            queue.push_back((job, done.clone()));
         }
     }
-    workers.more.notify_all();
+    if count == 2 {
+        workers.more.notify_one();
+    } else {
+        workers.more.notify_all();
+    }
     loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-        match job {
-            Some(job) => job(),
+        let next = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        match next {
+            Some((job, item_done)) => item_done.run_job(job),
             None => break,
         }
     }
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
-    }
+    done.wait_and_rethrow();
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's
@@ -1983,10 +3500,11 @@ pub(crate) fn wide_scoped<'a>(workers: &'static Workers, jobs: Vec<Box<dyn FnOnc
 
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
+const WIDE_MIN_SPLIT: usize = 256 << 10;
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
-/// (from, to, bytes), taken by [`take_snapshots`].
-static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+/// (from, to, bytes, src_is_wc), taken by [`take_snapshots`].
+static SNAPS: Mutex<Vec<(usize, usize, usize, bool)>> = Mutex::new(Vec::new());
 
 /// With [`wide_back`], when a submission's refreshes are done and before
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
@@ -1996,13 +3514,48 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
-    wide(copy_jobs(snaps));
+    wide(copy_jobs_wc(snaps));
 }
 
-/// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
-/// bytes each: long ones cut, short ones together.
+/// `copies` (from, to, bytes) as pieces of work for [`wide`].
+#[cfg(test)]
 fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
+    copy_jobs_wc(
+        copies
+            .into_iter()
+            .map(|(src, dst, len)| (src, dst, len, false))
+            .collect(),
+    )
+}
+
+/// `copies` (from, to, bytes, src_is_wc) as pieces of work up to [`WIDE_JOB`]
+/// bytes each: long ones cut, short ones grouped; WC BAR reads serialized on
+/// one worker so concurrent cores never thrash the PCIe read queue.
+fn copy_jobs_wc(copies: Vec<(usize, usize, usize, bool)>) -> Vec<Job> {
+    let mut cached = Vec::new();
+    let mut wc = Vec::new();
+    for entry in copies {
+        if entry.3 {
+            wc.push((entry.0, entry.1, entry.2));
+        } else {
+            cached.push((entry.0, entry.1, entry.2));
+        }
+    }
+    let total: usize = cached.iter().map(|c| c.2).sum();
+    let target = if total < WIDE_MIN_SPLIT {
+        WIDE_JOB
+    } else {
+        (total / 5).clamp(WIDE_MIN_SPLIT, WIDE_JOB)
+    };
     let mut jobs: Vec<Job> = Vec::new();
+    if !wc.is_empty() {
+        jobs.push(Box::new(move || {
+            for (src, dst, len) in wc {
+                // SAFETY: a ReBAR WC mapping and its cached snapshot, non-overlapping.
+                unsafe { copy_from_wc(src as *const u8, dst as *mut u8, len) };
+            }
+        }));
+    }
     let mut group: Vec<(usize, usize, usize)> = Vec::new();
     let mut bytes = 0;
     let flush = |group: &mut Vec<(usize, usize, usize)>, jobs: &mut Vec<Job>| {
@@ -2010,21 +3563,20 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
         if !group.is_empty() {
             jobs.push(Box::new(move || {
                 for (src, dst, len) in group {
-                    // SAFETY: the caller's ranges: a host copy's mapping and
-                    // its snapshot, which do not overlap.
+                    // SAFETY: a host copy's mapping and its snapshot, non-overlapping.
                     unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
                 }
             }));
         }
     };
-    for (src, dst, len) in copies {
+    for (src, dst, len) in cached {
         let mut at = 0;
         while at < len {
-            let n = (WIDE_JOB - bytes).min(len - at);
+            let n = (target - bytes).min(len - at);
             group.push((src + at, dst + at, n));
             at += n;
             bytes += n;
-            if bytes >= WIDE_JOB {
+            if bytes >= target {
                 flush(&mut group, &mut jobs);
                 bytes = 0;
             }
@@ -2043,31 +3595,51 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
         .iter()
         .map(|(shadow, address, end)| {
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
-            // The snapshot's memory stays until the range is done with
-            // (`copy_back_done`), which comes after this.
             match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
-                None => (0, 0, 0, 0, 0),
+                Some(before) => (
+                    shadow.data as usize,
+                    before.as_ptr() as usize,
+                    shadow.start as usize,
+                    from,
+                    to,
+                    shadow.rebar != 0,
+                ),
+                None => (0, 0, 0, 0, 0, false),
             }
         })
         .collect();
-    find_pieces(scans)
+    find_pieces_wc(scans)
 }
 
-/// For each of `scans` (where a copy's bytes are, where its snapshot's
-/// are, the title address the copy starts at, offsets from and to): the
-/// 64 KiB pieces (cut at multiples of 64 KiB of title memory, as
-/// [`Shadow::differing`] cuts them) of `[from, to)` whose bytes differ, as
-/// (offset, bytes) in order. On several threads ([`wide`]), in pieces of
-/// work of about [`WIDE_JOB`] bytes that hold whole pieces.
+#[cfg(test)]
 fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
-    // What a job finds: (which scan, its place among that scan's jobs, the
-    // pieces).
+    find_pieces_wc(
+        scans
+            .into_iter()
+            .map(|(data, before, start, from, to)| (data, before, start, from, to, false))
+            .collect(),
+    )
+}
+
+/// For each of `scans` (copy pointer, snapshot pointer, copy title start,
+/// offsets from and to, whether the copy pointer is write-combined): the
+/// 64 KiB pieces of `[from, to)` whose bytes differ, as (offset, bytes) in order.
+fn find_pieces_wc(scans: Vec<(usize, usize, usize, usize, usize, bool)>) -> Vec<Vec<(usize, usize)>> {
     type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
-    // A job's part of a scan: the scan, then which and place.
-    type Part = (usize, usize, usize, usize, usize, usize, usize);
+    type Part = (usize, usize, usize, usize, usize, bool, usize, usize);
+    let total_cached: usize = scans
+        .iter()
+        .filter(|s| !s.5)
+        .map(|s| s.4.saturating_sub(s.3))
+        .sum();
+    let target = if total_cached < WIDE_MIN_SPLIT {
+        WIDE_JOB
+    } else {
+        (total_cached / 5).clamp(WIDE_MIN_SPLIT, WIDE_JOB)
+    };
     let found: Arc<Mutex<Found>> = Arc::default();
     let mut jobs: Vec<Job> = Vec::new();
+    let mut wc_group: Vec<Part> = Vec::new();
     let mut group: Vec<Part> = Vec::new();
     let mut bytes = 0;
     let flush = |group: &mut Vec<Part>, jobs: &mut Vec<Job>| {
@@ -2078,22 +3650,22 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         let found = found.clone();
         jobs.push(Box::new(move || {
             let mut mine: Found = Vec::with_capacity(group.len());
-            for (data, before, start, from, to, which, place) in group {
+            for (data, before, start, from, to, is_wc, which, place) in group {
                 let mut pieces = Vec::new();
                 let mut at = from;
                 while at < to {
                     let n = (PIECE - (start + at) % PIECE).min(to - at);
-                    // SAFETY: inside the copy's mapping and its snapshot
-                    // (which holds the copy's bytes at the copy's offsets);
-                    // nothing writes either while a submission's results
-                    // are compared.
-                    let (now, old) = unsafe {
-                        (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
-                            std::slice::from_raw_parts((before + at) as *const u8, n),
-                        )
+                    // SAFETY: inside the copy's mapping and its snapshot;
+                    // nothing writes either while a submission's results are compared.
+                    let same = if is_wc {
+                        unsafe { slices_equal_wc((data + at) as *const u8, (before + at) as *const u8, n) }
+                    } else {
+                        unsafe {
+                            std::slice::from_raw_parts((data + at) as *const u8, n)
+                                == std::slice::from_raw_parts((before + at) as *const u8, n)
+                        }
                     };
-                    if now != old {
+                    if !same {
                         pieces.push((at, n));
                     }
                     at += n;
@@ -2104,11 +3676,16 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }));
     };
     let count = scans.len();
-    for (which, (data, before, start, from, to)) in scans.into_iter().enumerate() {
+    for (which, (data, before, start, from, to, is_wc)) in scans.into_iter().enumerate() {
+        if is_wc {
+            if from < to {
+                wc_group.push((data, before, start, from, to, true, which, 0));
+            }
+            continue;
+        }
         let (mut at, mut place) = (from, 0);
         while at < to {
-            // Cut where pieces end, so that every job sees whole pieces.
-            let room = (WIDE_JOB - bytes).max(PIECE);
+            let room = (target - bytes).max(PIECE);
             let mut next = (at + room).min(to);
             if next < to {
                 next -= (start + next) % PIECE;
@@ -2116,16 +3693,17 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     next = (at + PIECE - (start + at) % PIECE).min(to);
                 }
             }
-            group.push((data, before, start, at, next, which, place));
+            group.push((data, before, start, at, next, false, which, place));
             bytes += next - at;
             place += 1;
             at = next;
-            if bytes >= WIDE_JOB {
+            if bytes >= target {
                 flush(&mut group, &mut jobs);
                 bytes = 0;
             }
         }
     }
+    flush(&mut wc_group, &mut jobs);
     flush(&mut group, &mut jobs);
     wide(jobs);
     let mut found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
@@ -2318,7 +3896,7 @@ mod wide_tests {
         let src: Vec<u8> = (0..(40usize << 20)).map(|i| (i * 31 + 7) as u8).collect();
         let mut dst = vec![0u8; src.len()];
         // SAFETY: two separate allocations of the same length.
-        unsafe { super::copy_wide(src.as_ptr(), dst.as_mut_ptr(), src.len()) };
+        unsafe { super::copy_wide(src.as_ptr(), dst.as_mut_ptr(), src.len(), false) };
         assert!(src == dst);
     }
 
@@ -2415,14 +3993,11 @@ fn back_piece(
     host: &mut [u8],
     old: &[u8],
     title: &mut Vec<u8>,
-    mask: &mut Vec<u8>,
+    _mask: &mut Vec<u8>,
     runs: &mut Vec<(usize, usize)>,
     read: impl FnOnce(usize, &mut [u8]) -> bool,
 ) -> Option<(usize, usize)> {
     runs.clear();
-    // From the first byte that differs to the last: title memory is read
-    // and written there only (a shader that sets a few words of a piece
-    // cost a read, a walk and a write of all 64 KiB of it).
     let first = first_difference(host, old)?;
     let last = last_difference(host, old).unwrap_or(first);
     let n = last + 1 - first;
@@ -2432,43 +4007,8 @@ fn back_piece(
     if !read(first, title) {
         return None;
     }
-    // Title memory with the GPU's bytes put in; the copy takes the title's
-    // bytes in turn.
-    // Without a branch, so the loop runs many bytes at a time: the GPU's
-    // byte where the copy's byte is not what it was before the submission
-    // and the title left its byte as it was, else the title's. (With the
-    // two searches above this was 44 ms a frame for 970 pieces.)
-    // Where the shader and the title both changed a byte while the GPU ran,
-    // the title's stays: the shader computed its byte from the copy's older
-    // data (one cleared a bit of a record the title had already replaced,
-    // and copying it back broke the title's object: an access violation
-    // through 0xffffffff00000000; PalmVIDev e0b70476, VIctory f39c6c2).
-    mask.clear();
-    mask.resize(n, 0);
-    let mut differs = 0u8;
-    for (((t, h), o), m) in title.iter_mut().zip(host.iter_mut()).zip(old).zip(mask.iter_mut()) {
-        let gpu = if (*h != *o) & (*t == *o) { 0xffu8 } else { 0 };
-        let merged = (*t & !gpu) | (*h & gpu);
-        *m = merged ^ *t;
-        differs |= *m;
-        *t = merged;
-        *h = merged;
-    }
-    if differs == 0 {
+    if !merge_back_piece(title, host, old, runs) {
         return None;
-    }
-    let mut i = 0;
-    while i < n {
-        while i < n && mask[i] == 0 {
-            i += 1;
-        }
-        let start = i;
-        while i < n && mask[i] != 0 {
-            i += 1;
-        }
-        if i > start {
-            runs.push((start, i - start));
-        }
     }
     Some((first, n))
 }
@@ -2972,6 +4512,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if self.deferred_count.load(Ordering::Acquire) > 0 || self.resync_count.load(Ordering::Acquire) > 0 {
+            self.lazy_flush_all_on_drop();
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2979,6 +4522,9 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if self.rebar != 0 {
+            rebar::released(self.rebar);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -3163,7 +4709,7 @@ pub(crate) fn window_use() -> [u64; 8] {
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        let pages = copied.copied_count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -3340,7 +4886,7 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
-        let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+        let pages = ((start + len).div_ceil(PAGE as u64) - start / PAGE as u64) as usize;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
@@ -3349,9 +4895,10 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
+            copied: Mutex::new(CopiedPages::new(pages)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            has_pending: AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
@@ -3365,7 +4912,17 @@ impl Shadow {
             card: None,
             window: false,
             uploaded: 0,
+            rebar: 0,
+            lazy_state: (0..pages).map(|_| AtomicU8::new(LAZY_EAGER)).collect(),
+            lazy_strikes: (0..pages).map(|_| AtomicU8::new(0)).collect(),
+            lazy_last_flush_frame: (0..pages).map(|_| AtomicU32::new(0)).collect(),
+            lazy_cool_until: (0..pages).map(|_| AtomicU32::new(0)).collect(),
+            deferred_count: AtomicUsize::new(0),
+            resync_count: AtomicUsize::new(0),
+            last_write_fence: AtomicU64::new(0),
             place: None,
+            #[cfg(test)]
+            lazy_opted_in: false,
         }
     }
 
@@ -3424,6 +4981,48 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        // Flush overlapping OTHER shadows' deferred pages and resync any
+        // `LAZY_RESYNC` pages ONLY on subranges not already in `self.pending`:
+        // ranges in `self.pending` may be concurrently read/merged by the relay
+        // thread (`card_merge_relay` holding `self.before.lock()` over `self.data`)
+        // and still need their `FlushedBaseline` intact.
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        let need_other = LAZY_ARMED_COUNT.load(Ordering::Acquire) > 0;
+        let need_resync = self.resync_count.load(Ordering::Acquire) > 0;
+        if from < to && (need_other || need_resync) {
+            let busy_raw: Vec<(usize, usize)> = if self.has_pending.load(Ordering::Acquire) {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .copied()
+                    .filter(|&(a, e)| a < to && e > from)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let free: Vec<(usize, usize)> = if busy_raw.is_empty() {
+                vec![(from, to)]
+            } else {
+                let busy_pages: Vec<(usize, usize)> = busy_raw
+                    .iter()
+                    .map(|&(a, e)| (a & !(PAGE - 1), e.div_ceil(PAGE).saturating_mul(PAGE)))
+                    .collect();
+                outside(from, to, busy_pages)
+            };
+            for (a, e) in free {
+                if need_other && LAZY_ARMED_COUNT.load(Ordering::Acquire) > 0 {
+                    let flushed = lazy_flush_other_shadows(self.id, a, e);
+                    if !flushed.is_empty() {
+                        self.resync_pages_from_title(&flushed, &busy_raw);
+                    }
+                }
+                if self.resync_count.load(Ordering::Acquire) > 0 {
+                    self.lazy_resync_range(a, e, &busy_raw);
+                }
+            }
+        }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -3440,16 +5039,25 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
-        let mut parts = vec![self.inside(address, len)];
+        let (init_from, init_to) = self.inside(address, len);
+        let mut parts = Vec::with_capacity(4);
+        if init_from < init_to {
+            parts.push((init_from, init_to));
+        }
+        let mut rest = Vec::with_capacity(4);
         for &(a, e) in pending.iter() {
+            if parts.is_empty() {
+                break;
+            }
             let (a, e) = self.inside(a, e - a);
-            let mut rest = Vec::with_capacity(parts.len() + 1);
-            for (from, to) in parts {
+            rest.clear();
+            for &(from, to) in &parts {
                 if e <= from || a >= to {
                     rest.push((from, to));
                     continue;
@@ -3461,21 +5069,20 @@ impl Shadow {
                     rest.push((e, to));
                 }
             }
-            parts = rest;
+            std::mem::swap(&mut parts, &mut rest);
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
+        if taken == 0 {
+            return;
+        }
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
+        let is_wc = self.rebar != 0;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
-            // Piece by piece, and only the pieces not known current. A
-            // piece the part holds whole is current from now on; of a
-            // piece it holds partly only the part's bytes are taken, as
-            // without the switch, and it is taken again next time (the
-            // rest of it may belong to a range declared earlier, whose
-            // bytes stay as they were taken).
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             if kept.0.is_empty() {
                 kept.0 = vec![false; self.pieces(0, total.max(1)).end];
@@ -3493,7 +5100,11 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        if is_wc {
+                            copy_from_wc(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        } else {
+                            std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        }
                     }
                     kept.0[piece] = whole;
                 }
@@ -3501,14 +5112,14 @@ impl Shadow {
             return;
         }
         if wide_back() {
-            // Noted, and taken with the submission's other snapshots when
-            // its refreshes are done (`take_snapshots`): the range is
-            // declared from here on, so nothing changes its bytes before
-            // then. The snapshot's memory stays where it is until the
-            // range is done with (`copy_back_done`).
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
             let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
-            snaps.extend(parts.into_iter().filter(|&(from, to)| from < to).map(|(from, to)| (data + from, snapshot + from, to - from)));
+            snaps.extend(
+                parts
+                    .into_iter()
+                    .filter(|&(from, to)| from < to)
+                    .map(|(from, to)| (data + from, snapshot + from, to - from, is_wc)),
+            );
             return;
         }
         for (from, to) in parts {
@@ -3516,7 +5127,7 @@ impl Shadow {
                 // SAFETY: the copy's mapping and the snapshot's allocation
                 // (`pooled`) both hold `total` bytes, and `to <= total`.
                 unsafe {
-                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from);
+                    copy_wide(self.data.add(from), snapshot.as_mut_ptr().add(from), to - from, is_wc);
                 }
             }
         }
@@ -3532,30 +5143,30 @@ impl Shadow {
     /// [`Shadow::writing`] and not yet done: `Host::execute` passes the
     /// union of a submission's ranges, each byte once, then calls
     /// [`Shadow::copy_back_done`].
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    pub(crate) fn copy_back(self: &Arc<Self>, address: usize, len: usize) -> usize {
         self.copy_back_with(address, len, None)
     }
 
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
-    pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+    pub(crate) fn copy_back_with(self: &Arc<Self>, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
         self.compared(from, to);
-        if let Some(before) = &*snapshot
+        if let Some(before_vec) = snapshot.as_mut()
             && from < to
         {
+            if self.resync_count.load(Ordering::Acquire) > 0 {
+                self.lazy_apply_flushed_baseline(from, &mut before_vec[from..to]);
+            }
             // SAFETY: `writing` set the snapshot's bytes of every declared
             // range, at the copy's offsets.
-            let before = unsafe { std::slice::from_raw_parts(before.as_ptr().add(from), to - from) };
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission (on several threads: gigabytes a frame, bound by
-            // memory speed), title memory read only where the GPU wrote.
+            let before = unsafe { std::slice::from_raw_parts(before_vec.as_ptr().add(from), to - from) };
             #[cfg(feature = "diagnostics")]
             let scanning = std::time::Instant::now();
             let differing = match found {
@@ -3569,40 +5180,100 @@ impl Shadow {
                 add(C::BackDiffer, differing.len() as u64);
                 std::time::Instant::now()
             };
-            // Where the copy changes (the GPU wrote, and below the title's
-            // bytes come in), a kept snapshot is no longer current.
+            if differing.is_empty() {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
+                return 0;
+            }
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            // Sized to each stretch read (`back_piece`): a zeroed 64 KiB per
-            // range, most of whose ranges differ nowhere, was most of the
-            // work for small ranges.
-            let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
-            for (at, n) in differing {
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
-                let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
-                    continue;
-                };
-                let at = at + first;
-                crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
-                crate::watch::writing(start + at, n);
-                // Only the GPU's bytes (upstream #2009): the rest of the
-                // stretch is the title's as read, and a title write landing
-                // there since stays.
-                for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-                    written += len;
-                }
-            }
-            // Our write shows as a title write at the copy's next refresh,
-            // which copies those pages once more (some dozens of MB a
-            // frame). Asking about the whole range here, to note them
-            // current, cost more: 19-31 askings a frame over 110-174 MB of
-            // view memory, each a walk of its guards.
+            let lazy = lazy_copyback();
+            let deferred_mask: Vec<bool> = if lazy && !differing.is_empty() {
+                let offsets: Vec<(usize, usize)> = differing.iter().map(|&(at, n)| (at, at + n)).collect();
+                self.try_defer_shadow_pieces(&offsets, None)
+            } else {
+                Vec::new()
+            };
+            let is_wc = self.rebar != 0;
+            let mut runs = Vec::new();
+            let mut mask = Vec::new();
+            SCRATCH_TITLE.with(|title_cell| {
+                let mut title = title_cell.borrow_mut();
+                SCRATCH_WC.with(|wc_cell| {
+                    let mut wc_buf = wc_cell.borrow_mut();
+                    if is_wc && wc_buf.len() < PIECE {
+                        wc_buf.resize(PIECE, 0);
+                    }
+                    for (idx, (at, n)) in differing.into_iter().enumerate() {
+                        if deferred_mask.get(idx).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        let old = &before[at - from..at - from + n];
+                        if is_wc {
+                            // Copy WC GPU upload memory into L1-cached scratch ONCE
+                            // via AVX2 streaming loads (`VMOVNTDQA`), diff and merge
+                            // in cached memory, and store back only title-modified
+                            // runs followed by `_mm_sfence()`.
+                            let wc_slice = &mut wc_buf[..n];
+                            // SAFETY: inside the ReBAR mapping; `n <= PIECE`.
+                            unsafe { copy_from_wc(self.data.add(at), wc_slice.as_mut_ptr(), n) };
+                            let Some(first) = first_difference(wc_slice, old) else {
+                                continue;
+                            };
+                            let last = last_difference(wc_slice, old).unwrap_or(first);
+                            let (at, n) = (at + first, last + 1 - first);
+                            let host_orig = &wc_slice[first..=last];
+                            let old = &old[first..=last];
+                            title.clear();
+                            title.resize(n, 0);
+                            if !crate::host::read_into((start + at) as *const u8, &mut title) {
+                                continue;
+                            }
+                            let differs = merge_gpu_into_title_runs(&mut title, host_orig, old, &mut runs);
+                            let wc_runs = changed_runs(&title, host_orig);
+                            for &(run_at, run_len) in &wc_runs {
+                                // SAFETY: inside the ReBAR mapping; sequential WC store.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        title.as_ptr().add(run_at),
+                                        self.data.add(at + run_at),
+                                        run_len,
+                                    );
+                                }
+                            }
+                            if !wc_runs.is_empty() {
+                                wc_sfence();
+                            }
+                            if differs {
+                                crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
+                                crate::watch::writing(start + at, n);
+                                for &(off, len) in &runs {
+                                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                                    written += len;
+                                }
+                            }
+                        } else {
+                            // SAFETY: inside the mapping; only the submitting thread
+                            // writes it.
+                            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                            let read = |first: usize, title: &mut [u8]| {
+                                crate::host::read_into((start + at + first) as *const u8, title)
+                            };
+                            let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
+                                continue;
+                            };
+                            let at = at + first;
+                            crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
+                            crate::watch::writing(start + at, n);
+                            for &(off, len) in &runs {
+                                crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                                written += len;
+                            }
+                        }
+                    }
+                });
+            });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
@@ -3709,7 +5380,7 @@ impl Shadow {
     /// and puts the title's bytes into the copy and the snapshot: the two
     /// never see each other half done. `now` and `title` are scratch
     /// memory. Returns the bytes written to title memory.
-    pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+    pub(crate) fn relay_merge(self: &Arc<Self>, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
@@ -3718,13 +5389,23 @@ impl Shadow {
         let Some(before) = snapshot.as_mut() else {
             return 0;
         };
+        if self.resync_count.load(Ordering::Acquire) > 0 {
+            self.lazy_apply_flushed_baseline(at, &mut before[at..at + n]);
+        }
+        if lazy_copyback() && self.try_defer_piece(at, at + n) {
+            return 0;
+        }
         now.clear();
         now.reserve(n);
         // SAFETY: inside the copy's mapping (checked above), read into
         // room just reserved; the card may write the mapping meanwhile, and
         // each byte read is one it held at some moment.
         unsafe {
-            std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            if self.rebar != 0 {
+                copy_from_wc(self.data.add(at), now.as_mut_ptr(), n);
+            } else {
+                std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            }
             now.set_len(n);
         }
         // SAFETY: the snapshot's allocation holds the copy's length
@@ -3738,8 +5419,10 @@ impl Shadow {
         let last = last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title = &mut title[..n];
         // Who touched the page since its last store is looked at before our
         // own read of it (`VICTORY_BACK_READS`): counted only.
         #[cfg(feature = "diagnostics")]
@@ -3753,18 +5436,18 @@ impl Shadow {
         }
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
-        let as_read = merge_race_on().then(|| title.clone());
+        let as_read = merge_race_on().then(|| title.to_vec());
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
+        crate::host::shaders_write(start + at, title);
+        if self.put_back_own(start + at, title) {
             #[cfg(feature = "diagnostics")]
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
             return n;
         }
         crate::watch::writing(start + at, n);
-        merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
+        merge_race(as_read.as_deref(), (self.start, self.len), start + at, title, "pc relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
@@ -3815,11 +5498,12 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
-                && *taken != 0
-                && *taken >= before
+            if let Some(idx) = page.checked_sub(base)
+                && let Some(taken) = copied.get(idx)
+                && taken != 0
+                && taken >= before
             {
-                *taken = (*taken).max(now);
+                copied.set(idx, taken.max(now));
                 OWN_WRITES[2].fetch_add(1, Ordering::Relaxed);
                 // A copy in the card's memory only: its CPU side is never
                 // written by the card, so it must equal title memory now.
@@ -3858,19 +5542,33 @@ impl Shadow {
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
     /// `[from, to)` of the copy that differ from `before` (the bytes from
-    /// `from` on), as (offset, bytes) in order; compared on several threads
-    /// when the range is big.
+    /// `from` on), as (offset, bytes) in order; compared on the kept worker
+    /// pool when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
-        let (start, data) = (self.start as usize, self.data as usize);
-        let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
+        let (start, data, is_wc) = (self.start as usize, self.data as usize, self.rebar != 0);
+        let before_ptr = before.as_ptr() as usize;
+        let scan = move |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
             let mut at = a;
             while at < b {
                 let n = (PIECE - (start + at) % PIECE).min(b - at);
-                // SAFETY: inside the mapping, which nothing writes while a
-                // submission's results are compared.
-                let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
-                if host != &before[at - from..at - from + n] {
+                // SAFETY: inside the mapping and `before`, which nothing
+                // writes while a submission's results are compared.
+                let same = if is_wc {
+                    unsafe {
+                        slices_equal_wc(
+                            (data + at) as *const u8,
+                            (before_ptr + (at - from)) as *const u8,
+                            n,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts((data + at) as *const u8, n)
+                            == std::slice::from_raw_parts((before_ptr + (at - from)) as *const u8, n)
+                    }
+                };
+                if !same {
                     found.push((at, n));
                 }
                 at += n;
@@ -3878,12 +5576,15 @@ impl Shadow {
             found
         };
         const PER_THREAD: usize = 16 << 20;
-        let threads = ((to - from) / PER_THREAD).clamp(1, 8);
+        let threads = if is_wc { 1 } else { ((to - from) / PER_THREAD).clamp(1, 8) };
         if threads == 1 {
             return scan(from, to);
         }
-        // Cut on piece boundaries, so that every thread sees whole pieces.
+        // Cut on piece boundaries, so that every worker sees whole pieces.
         let cut = |i: usize| {
+            if i == 0 {
+                return from;
+            }
             if i == threads {
                 return to;
             }
@@ -3900,7 +5601,9 @@ impl Shadow {
                 .map(|i| {
                     let (a, b) = (cut(i), cut(i + 1));
                     Box::new(move || {
-                        *parts_ref[i].lock().unwrap_or_else(|e| e.into_inner()) = scan(a, b);
+                        if a < b {
+                            *parts_ref[i].lock().unwrap_or_else(|e| e.into_inner()) = scan(a, b);
+                        }
                     }) as Box<dyn FnOnce() + Send + '_>
                 })
                 .collect();
@@ -3911,7 +5614,7 @@ impl Shadow {
             let parts: Vec<_> = (0..threads)
                 .map(|i| {
                     let (a, b) = (cut(i), cut(i + 1));
-                    s.spawn(move || scan(a, b))
+                    s.spawn(move || if a < b { scan(a, b) } else { Vec::new() })
                 })
                 .collect();
             parts
@@ -3943,6 +5646,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.has_pending.store(!pending.is_empty(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -4000,7 +5704,13 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.has_pending.load(Ordering::Acquire)
+    }
+
+    /// Stamps the latest `Host::fence` value signalled after an async GPU
+    /// write to this shadow (lock-free, read by `LazyReadback::read_pages`).
+    pub(crate) fn note_write_fence(&self, fence: u64) {
+        self.last_write_fence.fetch_max(fence, Ordering::Release);
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -4015,6 +5725,9 @@ impl Shadow {
     /// (`crate::host::late`): the ranges are those of flights in the air,
     /// which are then settled before this refresh.
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return false;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -4035,9 +5748,25 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
+        let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
+        let has_resync = self.resync_count.load(Ordering::Acquire) > 0;
+        if has_resync {
+            for &(a, e) in &busy {
+                for page in a / PAGE..e.div_ceil(PAGE) {
+                    if page >= base
+                        && (page - base) < self.lazy_state.len()
+                        && self.lazy_state[page - base].load(Ordering::Acquire) == LAZY_RESYNC
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => stale_pages_in(base, &copied.at, a, e, &written)
+                .into_iter()
+                .any(|p| !has_deferred || !is_lazy_held(self.lazy_state[p - base].load(Ordering::Acquire))),
             None => true,
         })
     }
@@ -4059,6 +5788,9 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        if !self.has_pending.load(Ordering::Acquire) {
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         let _reads_as = crate::backreads::reading_as(crate::backreads::UNDER, self.id);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -4082,112 +5814,175 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        let mut title = vec![0u8; PAGE];
-        for (a, e) in busy {
-            // As the refresh itself asks (`update_free`): the journal if
-            // the submission's asking covered the range, else the kernel,
-            // else the guards. The journal alone said nothing for copies
-            // of view memory, which is guarded and not write-watched, and
-            // those were all of run 99's cases: the flights were settled
-            // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                MERGE_GAVE_UP[1].fetch_add(1, Ordering::Relaxed);
-                return true;
-            };
-            let stale: Vec<usize> = {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
-            };
-            for page in stale {
-                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                if lo >= hi {
+        let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
+        // If any page under in-flight GPU writes is `LAZY_RESYNC` (VEH flushed
+        // a prior flight's GPU writes while `self.data`/snapshot still hold older
+        // bytes), settle in-flight flights cleanly instead of misclassifying
+        // prior GPU writes as fresh CPU writes.
+        if self.resync_count.load(Ordering::Acquire) > 0 {
+            for &(a, e) in &busy {
+                for page in a / PAGE..e.div_ceil(PAGE) {
+                    if page >= base
+                        && (page - base) < self.lazy_state.len()
+                        && self.lazy_state[page - base].load(Ordering::Acquire) == LAZY_RESYNC
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        SCRATCH_TITLE.with(|title_cell| {
+            let mut title_buf = title_cell.borrow_mut();
+            for (a, e) in busy {
+                let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                    MERGE_GAVE_UP[1].fetch_add(1, Ordering::Relaxed);
+                    return true;
+                };
+                let stale: Vec<usize> = {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    stale_pages_in(base, &copied.at, a, e, &written)
+                        .into_iter()
+                        .filter(|&p| {
+                            !has_deferred || !is_lazy_held(self.lazy_state[p - base].load(Ordering::Acquire))
+                        })
+                        .collect()
+                };
+                if stale.is_empty() {
                     continue;
                 }
-                let n = hi - lo;
-                let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                // A page that is not there is left as it is, and looked at
-                // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
+                if title_buf.len() < PAGE {
+                    title_buf.resize(PAGE, 0);
                 }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
-                let at = lo - start;
-                if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
-                    // Lean ([`patch_lean_now`]): a page of many runs is
-                    // patched under the cap too.
-                    let lean = runs.len() <= *runs_left
-                        && runs.len() > patch_page_runs()
-                        && masked_patch_now()
-                        && patch_lean_now();
-                    if runs.len() > *runs_left || lean {
-                        // Past the cap: the page's exact changed bytes as a
-                        // masked patch ([`masked_patch_now`]), no settle.
-                        if masked_patch_now() && at + n <= u32::MAX as usize {
-                            if lean {
-                                PATCH_LEAN[0].fetch_add(1, Ordering::Relaxed);
-                                PATCH_LEAN[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                for page in stale {
+                    let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                    if lo >= hi {
+                        continue;
+                    }
+                    let st_before = self.lazy_state[page - base].load(Ordering::Acquire);
+                    if is_lazy_held(st_before) {
+                        continue;
+                    }
+                    if st_before == LAZY_RESYNC {
+                        return true;
+                    }
+                    let n = hi - lo;
+                    let title = &mut title_buf[..n];
+                    let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
+                    }
+                    // Re-check after `read_into`: if a concurrent VEH fault (or
+                    // `read_into`'s flush) transitioned this page to
+                    // `LAZY_RESYNC` after the upfront check, `title` holds
+                    // prior GPU bytes that must not be diffed against stale
+                    // `self.data` / snapshot — settle in-flight flights instead.
+                    if self.lazy_state[page - base].load(Ordering::Acquire) == LAZY_RESYNC {
+                        return true;
+                    }
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    let at = lo - start;
+                    if self.card.is_some() {
+                        // SAFETY: inside the mapping of the copy's CPU side,
+                        // which only the submitting thread writes.
+                        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                        let runs = joined_over(changed_runs(title, held), merge_gap());
+                        // Lean ([`patch_lean_now`]): a page of many runs is
+                        // patched under the cap too.
+                        let lean = runs.len() <= *runs_left
+                            && runs.len() > patch_page_runs()
+                            && masked_patch_now()
+                            && patch_lean_now();
+                        if runs.len() > *runs_left || lean {
+                            // Past the cap: the page's exact changed bytes as a
+                            // masked patch ([`masked_patch_now`]), no settle.
+                            if masked_patch_now() && at + n <= u32::MAX as usize {
+                                if lean {
+                                    PATCH_LEAN[0].fetch_add(1, Ordering::Relaxed);
+                                    PATCH_LEAN[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                                }
+                                let exact = changed_runs(title, held);
+                                self.card_patched(at, title, &exact);
+                                for &(r, m) in &exact {
+                                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                                }
+                            } else {
+                                MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
+                                return true;
                             }
-                            let exact = changed_runs(title, held);
-                            self.card_patched(at, title, &exact);
-                            for &(r, m) in &exact {
+                        } else {
+                            *runs_left -= runs.len();
+                            for (r, m) in runs {
                                 held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                self.card_changed(at + r, at + r + m);
                                 MERGED[1].fetch_add(1, Ordering::Relaxed);
                                 MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                             }
-                        } else {
-                            MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
-                            return true;
                         }
                     } else {
-                        *runs_left -= runs.len();
-                        for (r, m) in runs {
+                        let Some(snapshot) = before.as_mut() else {
+                            MERGE_GAVE_UP[3].fetch_add(1, Ordering::Relaxed);
+                            return true;
+                        };
+                        // SAFETY: the snapshot's allocation holds the copy's
+                        // bytes at the copy's offsets (`writing`), and these
+                        // are in a declared range.
+                        let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                        let runs = changed_runs(title, held);
+                        for &(r, m) in &runs {
+                            // SAFETY: inside the copy's mapping.
+                            unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                             held[r..r + m].copy_from_slice(&title[r..r + m]);
-                            self.card_changed(at + r, at + r + m);
                             MERGED[1].fetch_add(1, Ordering::Relaxed);
                             MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                         }
+                        if self.rebar != 0 && !runs.is_empty() {
+                            wc_sfence();
+                        }
                     }
-                } else {
-                    let Some(snapshot) = before.as_mut() else {
-                        MERGE_GAVE_UP[3].fetch_add(1, Ordering::Relaxed);
-                        return true;
-                    };
-                    // SAFETY: the snapshot's allocation holds the copy's
-                    // bytes at the copy's offsets (`writing`), and these
-                    // are in a declared range.
-                    let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
-                        // SAFETY: inside the copy's mapping. The card may be
-                        // writing the copy beside these bytes; they are
-                        // written here and nothing around them.
-                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    drop(before);
+                    if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                        copied.set(page - base, now);
                     }
                 }
-                drop(before);
-                // Taken, if the range holds all of the page that is in the
-                // copy; else the rest of it is the refresh's, which notes
-                // only whole pages, and the page is looked at again.
-                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
-                    }
+            }
+            false
+        })
+    }
+
+    /// Whether `[address, address + len)` overlaps both `self.pending` and at
+    /// least one `LAZY_RESYNC` page (used by `host::stale_under_flights` for
+    /// UAV-only `Step::GpuWrite` commands without a preceding `Step::Refresh`).
+    pub(crate) fn has_lazy_resync_under_writes(&self, address: usize, len: usize) -> bool {
+        if self.resync_count.load(Ordering::Acquire) == 0 || !self.has_pending.load(Ordering::Acquire) {
+            return false;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return false;
+        }
+        let busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e)| a < to && e > from)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .collect();
+        if busy.is_empty() {
+            return false;
+        }
+        let base = start / PAGE;
+        for (a, e) in busy {
+            for page in a / PAGE..e.div_ceil(PAGE) {
+                if page >= base
+                    && (page - base) < self.lazy_state.len()
+                    && self.lazy_state[page - base].load(Ordering::Acquire) == LAZY_RESYNC
+                {
+                    return true;
                 }
             }
         }
@@ -4207,6 +6002,9 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        if !self.has_pending.load(Ordering::Acquire) {
+            return self.update_free(from, to, &[]);
+        }
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4216,33 +6014,53 @@ impl Shadow {
             .filter(|&(a, e)| a < to && e > from)
             .collect();
         if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
+            for &(a, e) in &busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, &busy);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, &busy);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, &[])
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(&self, from: usize, to: usize, skip_busy: &[(usize, usize)]) -> usize {
+        // Detect any overlapping OTHER shadow's deferred pages WITHOUT flushing
+        // or unprotecting them: marking those pages stale (`copied = 0`) makes
+        // `copy_stale` -> `copy` -> `host::copy_mapped` read their fresh GPU
+        // bytes directly from the owning shadow via self-bypass while keeping
+        // the owning shadow's pages GPU-resident (`PAGE_NOACCESS`, zero VEH
+        // faults, zero `LAZY_RESYNC` ping-pong).
+        let other_deferred = if LAZY_ARMED_COUNT.load(Ordering::Acquire) > 0 {
+            lazy_other_deferred_pages(self.id, from, to)
+        } else {
+            Vec::new()
+        };
+        if !other_deferred.is_empty() {
+            let base = self.start as usize / PAGE;
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for &page in &other_deferred {
+                if page >= base {
+                    copied.set(page - base, 0);
+                }
+            }
+        }
+        if self.deferred_count.load(Ordering::Acquire) > 0 || self.resync_count.load(Ordering::Acquire) > 0 {
+            self.lazy_prepare_update(from, to, skip_busy);
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             // The light refresh (`VICTORY_LIGHT_REFRESH`): nothing of the
             // range was written that the copy does not hold, and the
             // journal says so with nothing asked.
-            if crate::watch::light() && self.nothing_new(from, to) {
+            if crate::watch::light() && other_deferred.is_empty() && self.nothing_new(from, to) {
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4279,6 +6097,18 @@ impl Shadow {
                         add(C::RefreshSomeUs, us);
                     }
                 }
+                // Keep pages still deferred in another shadow marked `0` so
+                // future GPU writes on that owning shadow remain visible to
+                // this overlapping shadow on subsequent refreshes.
+                if !other_deferred.is_empty() {
+                    let base = self.start as usize / PAGE;
+                    let mut c = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    for &page in &other_deferred {
+                        if page >= base {
+                            c.set(page - base, 0);
+                        }
+                    }
+                }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4291,13 +6121,20 @@ impl Shadow {
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        let bytes = if self.deferred_count.load(Ordering::Acquire) > 0 {
+            self.copy_unwatched_skipping_deferred(from, to)
+        } else {
+            self.copy(from, to)
+        };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
-        to - from
+        {
+            crate::copystat::add(crate::copystat::C::WholeBytes, bytes as u64);
+            if bytes > 0 {
+                crate::copystat::whole(from, bytes, started.elapsed().as_micros() as u64);
+            }
+        }
+        bytes
     }
 
     /// Whether a refresh of `[from, to)` would copy nothing, known before
@@ -4305,24 +6142,31 @@ impl Shadow {
     /// known to be watched yet.
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     fn unchanged_known(&self, from: usize, to: usize) -> bool {
-        if self.watched.load(Ordering::Relaxed) != 1 {
+        if self.watched.load(Ordering::Relaxed) != 1 || self.resync_count.load(Ordering::Acquire) != 0 {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        crate::watch::unchanged_known(from, to, self.start as usize / PAGE, &copied)
+        crate::watch::unchanged_known(from, to, self.start as usize / PAGE, &copied.at)
     }
 
     /// Whether [`Shadow::update_free`] of `[from, to)` would copy nothing,
     /// known without asking the kernel or the guards
     /// (`crate::watch::nothing_new`): the memory is watched, every page of
-    /// the range was taken, and none was noted written after it was.
-    /// `false` if the refresh would have to ask.
+    /// the range was taken (or is `LAZY_DEFERRED` on the GPU), and none was
+    /// noted written after it was. `false` if the refresh would have to ask.
     fn nothing_new(&self, from: usize, to: usize) -> bool {
-        if self.watched.load(Ordering::Relaxed) != 1 {
+        if self.watched.load(Ordering::Relaxed) != 1 || self.resync_count.load(Ordering::Acquire) != 0 {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        crate::watch::nothing_new(from, to, self.start as usize / PAGE, &copied)
+        let base = self.start as usize / PAGE;
+        if self.deferred_count.load(Ordering::Acquire) == 0 {
+            crate::watch::nothing_new(from, to, base, &copied.at)
+        } else {
+            crate::watch::nothing_new_with_lazy(from, to, base, &copied.at, |idx| {
+                idx < self.lazy_state.len() && self.lazy_state[idx].load(Ordering::Acquire) == LAZY_DEFERRED
+            })
+        }
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
@@ -4344,14 +6188,28 @@ impl Shadow {
         static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
         static SAID: AtomicU64 = AtomicU64::new(0);
         let start = self.start as usize;
+        let base = start / PAGE;
+        let is_wc = self.rebar != 0;
+        let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
         let mut title = [0u8; SAMPLE];
+        let mut wc_sample = [0u8; SAMPLE];
         let mut at = from;
         while at < to {
+            let idx = (at / PAGE) - base;
+            if has_deferred && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire)) {
+                at = (at / PAGE + 1) * PAGE;
+                continue;
+            }
             let n = SAMPLE.min(to - at);
             if crate::host::read_into(at as *const u8, &mut title[..n]) {
                 // SAFETY: `[from, to)` lies inside the buffer (`update`),
                 // so these bytes are inside the copy's mapping.
-                let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                let copy = if is_wc {
+                    unsafe { copy_from_wc(self.data.add(at - start).cast_const(), wc_sample.as_mut_ptr(), n) };
+                    &wc_sample[..n]
+                } else {
+                    unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) }
+                };
                 let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
                 let map = map.get_or_insert_with(Default::default);
                 if copy == &title[..n] {
@@ -4384,78 +6242,32 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
+    /// asking), whole pages within the buffer. Plans coalesced runs under
+    /// `self.copied`, then releases the mutex before executing the copies.
     ///
     /// `subs` ([`crate::watch::subpages`], `VICTORY_DIRTY_4K`): for a page the kernel's write watch found written,
     /// the 4 KiB pages its last asking found and the asking before that which found the page written. A copy that
     /// took the page at or after that earlier asking copies only those 4 KiB pages: the others have not been written
     /// since it took them (`crate::watch::dirty4k`).
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], subs: &[(usize, u64, u64, u16)]) -> usize {
-        const KERNEL_PAGE: usize = 4096;
         let narrow = !subs.is_empty() && crate::watch::dirty4k();
+        let count_dirty4k = crate::watch::dirty4k_kept();
         let base = self.start as usize / PAGE;
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
-        let mut subs = subs.iter().peekable();
-        let (mut bytes, mut run): (_, Option<usize>) = (0, None);
-        let last = (to - 1) / PAGE;
-        for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
-                }
-                _ => 0,
-            };
-            while subs.peek().is_some_and(|s| s.0 < page) {
-                subs.next();
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
+        let runs = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if has_deferred {
+                copied.plan_stale_with_subs(base, start, end, from, to, now, written, subs, narrow, count_dirty4k, |idx| {
+                    is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
+                })
+            } else {
+                copied.plan_stale_with_subs(base, start, end, from, to, now, written, subs, narrow, count_dirty4k, |_| false)
             }
-            // The page's entry, if it stands for the asking the refresh was given for the page.
-            let sub = subs.peek().filter(|s| s.0 == page && s.1 == write && write != 0).map(|s| (s.2, s.3));
-            let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                let taken = *at;
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
-                }
-                // Only the 4 KiB pages written since the copy took the page: the asking before the last one that
-                // found it written came no later than the copy's taking.
-                let found = sub.filter(|&(before, _)| taken != 0 && before <= taken).map(|(_, bits)| bits);
-                if crate::watch::dirty4k_kept() {
-                    crate::watch::dirty4k_count(found, narrow && found.is_some());
-                }
-                if narrow && let Some(bits) = found {
-                    if let Some(first) = run.take() {
-                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
-                    }
-                    let mut k = 0;
-                    while k < PAGE / KERNEL_PAGE {
-                        if bits & (1 << k) == 0 {
-                            k += 1;
-                            continue;
-                        }
-                        let a = k;
-                        while k < PAGE / KERNEL_PAGE && bits & (1 << k) != 0 {
-                            k += 1;
-                        }
-                        let (lo, hi) = ((page * PAGE + a * KERNEL_PAGE).max(from), (page * PAGE + k * KERNEL_PAGE).min(to));
-                        if lo < hi {
-                            bytes += self.copy(lo, hi);
-                        }
-                    }
-                    continue;
-                }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
-            }
-        }
-        // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        };
+        let mut bytes = 0;
+        for (run_from, run_to) in runs.iter() {
+            bytes += self.copy(run_from, run_to);
         }
         bytes
     }
@@ -4466,12 +6278,18 @@ impl Shadow {
         let _reads_as = crate::backreads::reading_as(crate::backreads::REFRESH, self.id);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        if self.card.is_some() && from < to && copy_changed() && self.copy_changed(from, to) {
+        if from >= to {
+            return 0;
+        }
+        if self.card.is_some() && copy_changed() && self.copy_changed(from, to) {
             return to - from;
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if self.rebar != 0 {
+            wc_sfence();
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
@@ -4552,6 +6370,7 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+        card.has_dirty.store(true, Ordering::Release);
         drop(dirty);
         // From none to some: [`card_dirty`] finds the copy in the list. (A
         // copy changed again before its ranges are taken is in it already;
@@ -4583,6 +6402,7 @@ impl Shadow {
         let mut patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
         patch.words.extend(words);
         patch.ranges.extend(runs.iter().map(|&(r, m)| (at + r, at + r + m)));
+        card.has_patch.store(true, Ordering::Release);
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -4705,42 +6525,32 @@ impl Shadow {
         // SAFETY: inside the mapping (checked above); only the submitting
         // thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        if self.resync_count.load(Ordering::Acquire) > 0 {
+            self.lazy_apply_flushed_baseline(at, old);
+        }
         let Some(first) = first_difference(gpu, old) else {
             return 0;
         };
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title = &mut title[..n];
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
-            // The stretch as read: what the card did not change is the
-            // title's, and may have been written again since.
-            let as_read = merge_race_on().then(|| title.clone());
-            // As in `copy_back`: the card's byte where it is not what it
-            // was before the submission, else the title's.
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
-                crate::host::shaders_write(start + at, &title[..]);
+            let as_read = merge_race_on().then(|| title.to_vec());
+            if merge_sync_card(title, gpu, old) {
+                crate::host::shaders_write(start + at, title);
                 crate::watch::writing(start + at, n);
-                merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
+                merge_race(as_read.as_deref(), (self.start, self.len), start + at, title, "card");
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
             }
         } else {
-            // Title memory is not mapped there: the copy keeps what the
-            // card wrote, as before.
             old.copy_from_slice(gpu);
         }
-        // The card's side and its "before" take the result.
         self.card_changed(at, at + n);
         written
     }
@@ -4777,13 +6587,25 @@ impl Shadow {
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
+        if self.resync_count.load(Ordering::Acquire) > 0 {
+            self.lazy_apply_flushed_baseline(at, held);
+        }
         let Some(first) = first_difference(gpu, held) else {
             return 0;
         };
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
-        let skip: Vec<(usize, usize)> = {
+        // Check `has_dirty` and `has_patch` FIRST, then `has_sent`: `card_dirty`
+        // and `card_patches` set `has_sent` (Release) before clearing
+        // `has_dirty`/`has_patch` (Release), so observing both false guarantees
+        // observing `has_sent == true` for any range transitioning to `sent`.
+        let skip: Vec<(usize, usize)> = if !card.has_dirty.load(Ordering::Acquire)
+            && !card.has_patch.load(Ordering::Acquire)
+            && !card.has_sent.load(Ordering::Acquire)
+        {
+            Vec::new()
+        } else {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -4795,8 +6617,10 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
-        title.clear();
-        title.resize(n, 0);
+        if title.len() < n {
+            title.resize(n, 0);
+        }
+        let title = &mut title[..n];
         // Who touched the page since its last store is looked at before our
         // own read of it (`VICTORY_BACK_READS`): counted only.
         #[cfg(feature = "diagnostics")]
@@ -4806,7 +6630,7 @@ impl Shadow {
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
-        let as_read = (mapped && merge_race_on()).then(|| title.clone());
+        let as_read = (mapped && merge_race_on()).then(|| title.to_vec());
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
@@ -4817,14 +6641,14 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
+        crate::host::shaders_write(start + at, title);
+        if self.put_back_own(start + at, title) {
             #[cfg(feature = "diagnostics")]
             crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
             return n;
         }
         crate::watch::writing(start + at, n);
-        merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
+        merge_race(as_read.as_deref(), (self.start, self.len), start + at, title, "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         #[cfg(feature = "diagnostics")]
         crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
@@ -4860,11 +6684,21 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
     tables_changed();
 }
 
-/// The title released it; lists that still hold its copy keep it alive.
+/// The title released it; flush any lazy GPU-resident pages before the title
+/// frees or reuses the backing memory, then let lists keep it alive if needed.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    let mut map = buffers();
-    tables_changed();
-    map.remove(&(start, resource));
+    let removed = {
+        let mut map = buffers();
+        tables_changed();
+        map.remove(&(start, resource)).and_then(|e| e.shadow)
+    };
+    if let Some(shadow) = removed
+        && shadow.deferred_count.load(Ordering::Acquire) > 0
+    {
+        // Keep `save_baseline = true` because in-flight lists may still hold
+        // `Arc<Shadow>` and settle via `card_merge_relay` / `relay_merge`.
+        shadow.lazy_flush_all(true);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -5172,12 +7006,17 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        // memory, and the CPU side stays in system RAM; otherwise opt-in ReBAR
+        // (`VICTORY_REBAR=2`) places the host copy in `D3D12_HEAP_TYPE_GPU_UPLOAD`.
+        let on_card = card_for(size);
+        let (buffer, data, card, rebar) = match on_card {
             Some(on_card) => {
+                let Some((staging, data)) = host()?.shared_buffer(size) else {
+                    CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+                    return None;
+                };
+                crate::host::name(&staging, || format!("title buffer {:#x}+{len:#x}", key.0));
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
                     start = format_args!("{:#x}", key.0),
@@ -5185,17 +7024,30 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
+                    staging,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
+                    has_dirty: AtomicBool::new(false),
                     sent: Mutex::default(),
                     patch: Mutex::default(),
+                    has_patch: AtomicBool::new(false),
+                    has_sent: AtomicBool::new(false),
                     size,
                     me: std::sync::OnceLock::new(),
                 };
-                (on_card, Some(card))
+                (on_card, data, Some(card), 0)
             }
-            None => (buffer, None),
+            None => match rebar_copy(rebar::Kind::Buffer, size) {
+                Some((buffer, data, rebar)) => {
+                    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x} (ReBAR)", key.0));
+                    (buffer, data, None, rebar)
+                }
+                None => {
+                    let (buffer, data) = host()?.shared_buffer(size)?;
+                    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+                    (buffer, data, None, 0)
+                }
+            },
         };
         placed_count(size, card.is_some());
         // SAFETY: a live buffer.
@@ -5215,6 +7067,7 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        shadow.rebar = rebar;
         let shadow = Arc::new(shadow);
         if let Some(card) = &shadow.card {
             let _ = card.me.set(Arc::downgrade(&shadow));
@@ -5415,25 +7268,43 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         tables_changed();
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    // buffer there, and the CPU side stays in system RAM; otherwise opt-in
+    // ReBAR (`VICTORY_REBAR=1|2`) places the window in `GPU_UPLOAD`.
+    let on_card = window_card_for(len);
+    let (buffer, data, card, rebar) = match on_card {
         Some(on_card) => {
+            let Some((staging, data)) = host()?.shared_buffer(len) else {
+                WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+                return None;
+            };
+            crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging: buffer,
+                staging,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
+                has_dirty: AtomicBool::new(false),
                 sent: Mutex::default(),
                 patch: Mutex::default(),
+                has_patch: AtomicBool::new(false),
+                has_sent: AtomicBool::new(false),
                 size: len,
                 me: std::sync::OnceLock::new(),
             };
-            (on_card, Some(card))
+            (on_card, data, Some(card), 0)
         }
-        None => (buffer, None),
+        None => match rebar_copy(rebar::Kind::Window, len) {
+            Some((buffer, data, rebar)) => {
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} (ReBAR)"));
+                (buffer, data, None, rebar)
+            }
+            None => {
+                let (buffer, data) = host()?.shared_buffer(len)?;
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+                (buffer, data, None, 0)
+            }
+        },
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5445,6 +7316,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
+    shadow.rebar = rebar;
     let shadow = Arc::new(shadow);
     if let Some(card) = &shadow.card {
         let _ = card.me.set(Arc::downgrade(&shadow));
@@ -5709,8 +7581,11 @@ mod card_merge_tests {
                 staging: staging.clone(),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
+                has_dirty: std::sync::atomic::AtomicBool::new(false),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 patch: Mutex::default(),
+                has_patch: std::sync::atomic::AtomicBool::new(false),
+                has_sent: std::sync::atomic::AtomicBool::new(true),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
                 me: std::sync::OnceLock::new(),
@@ -5803,3 +7678,3342 @@ pub(crate) fn near(va: u64) -> String {
     }
     text
 }
+
+/// Allocates a ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) host copy when opt-in
+/// `VICTORY_REBAR=1|2` permits it and VRAM headroom allows.
+fn rebar_copy(kind: rebar::Kind, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let host = host()?;
+    let res = rebar::reserve(kind, size, false)?;
+    let (buffer, data) = rebar::gpu_upload_buffer(host, size)?;
+    Some((buffer, data, res.commit()))
+}
+
+// ============================================================================
+// Opt-in Lazy GPU-Resident Write-Back (`VICTORY_LAZY_COPYBACK=1`, default OFF)
+// ============================================================================
+//
+// Strict Acyclic Lock Hierarchy (deadlock-free with Windows VEH):
+//   Level 0: `host.submitted`, `CARD_WORK`, `BUFFERS`, `LOOSE`, `EXACT`,
+//            `CARDED`, `Shadow::{copied, pending, before, kept, card.*}`,
+//            `watch::{JOURNAL, MAPPING, GUARDS}`.
+//   Level 1: `LAZY_TABLE` (metadata-only leaf table: armed/busy pages, pinned
+//            fence pages, active remap barriers, and flushed 64 KiB baselines).
+//            NEVER acquires Level 0 or Level 2 while held, and NEVER calls
+//            D3D12 or waits on GPU work.
+//   Level 2: `LAZY_GPU` (dedicated D3D12 allocator, command list, fence, event,
+//            and persistent 64 KiB `D3D12_HEAP_TYPE_READBACK` buffer). NEVER
+//            acquires Level 0 or Level 1 while held.
+//   Level 3: `FlushWait` (`Mutex<Option<FlushOutcome>>` + `Condvar`). Leaf only.
+//
+// VEH (`lazy_on_fault`) ONLY acquires Level 1 -> drops -> Level 2 -> drops ->
+// `VirtualProtect` + `memcpy` -> Level 1 -> drops -> Level 3. It NEVER touches
+// any Level 0 lock (`watch`, `Shadow`, `CARD_WORK`, `host.submitted`).
+
+/// Whether a `VICTORY_BACK_READS` environment value enables copy-back read
+/// diagnostics (`"1"`, `"2"`, `"alt"`, or any non-empty value other than `"0"`).
+fn back_reads_env_active(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Whether `VICTORY_BACK_READS` diagnostics are active in this process.
+/// Checked across both diagnostics and default builds so `PAGE_NOACCESS` arming
+/// never races with `backreads.rs` `VirtualUnlock`/`QueryWorkingSetEx` sampling.
+fn back_reads_active() -> bool {
+    #[cfg(test)]
+    {
+        match BACK_READS_TEST_OVERRIDE.load(Ordering::Acquire) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    if crate::backreads::on() {
+        return true;
+    }
+    static ACTIVE: OnceLock<bool> = OnceLock::new();
+    *ACTIVE.get_or_init(|| back_reads_env_active(std::env::var("VICTORY_BACK_READS").ok().as_deref()))
+}
+
+/// Whether opt-in Lazy GPU-Resident Write-Back is enabled
+/// (`VICTORY_LAZY_COPYBACK=1`; default OFF). Automatically disabled whenever
+/// `VICTORY_BACK_READS` is active so working-set sampling in `backreads.rs`
+/// never races with `PAGE_NOACCESS` protections.
+pub(crate) fn lazy_copyback() -> bool {
+    if back_reads_active() {
+        let requested = {
+            #[cfg(test)]
+            {
+                match LAZY_TEST_OVERRIDE.load(Ordering::Acquire) {
+                    1 => false,
+                    2 => true,
+                    _ => std::env::var_os("VICTORY_LAZY_COPYBACK").is_some_and(|v| v == "1"),
+                }
+            }
+            #[cfg(not(test))]
+            {
+                static REQ: OnceLock<bool> = OnceLock::new();
+                *REQ.get_or_init(|| std::env::var_os("VICTORY_LAZY_COPYBACK").is_some_and(|v| v == "1"))
+            }
+        };
+        if requested {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "VICTORY_LAZY_COPYBACK=1 disabled because VICTORY_BACK_READS is active \
+                     (working-set sampling in backreads.rs cannot coexist with PAGE_NOACCESS lazy arming)"
+                );
+            });
+        }
+        return false;
+    }
+    #[cfg(test)]
+    {
+        match LAZY_TEST_OVERRIDE.load(Ordering::Acquire) {
+            1 => return false,
+            2 => return true,
+            _ => {}
+        }
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_COPYBACK").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+static LAZY_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+static LAZY_TEST_FRAME: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+struct LazyFrameGuard {
+    prev: u32,
+}
+
+#[cfg(test)]
+impl LazyFrameGuard {
+    fn set(frame: u32) -> Self {
+        let prev = LAZY_TEST_FRAME.swap(frame, Ordering::AcqRel);
+        Self { prev }
+    }
+
+    fn update(frame: u32) {
+        LAZY_TEST_FRAME.store(frame, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl Drop for LazyFrameGuard {
+    fn drop(&mut self) {
+        LAZY_TEST_FRAME.store(self.prev, Ordering::Release);
+    }
+}
+
+fn lazy_current_frame() -> u32 {
+    #[cfg(test)]
+    {
+        let f = LAZY_TEST_FRAME.load(Ordering::Acquire);
+        if f > 0 {
+            return f;
+        }
+        if LAZY_TEST_OVERRIDE.load(Ordering::Acquire) != 0 {
+            return 0;
+        }
+    }
+    let f = crate::frame::current();
+    if f == 0 {
+        0
+    } else {
+        f.min((u32::MAX - 1) as u64) as u32
+    }
+}
+
+fn lazy_hot_params() -> (u8, u32) {
+    static PARAMS: OnceLock<(u8, u32)> = OnceLock::new();
+    *PARAMS.get_or_init(|| {
+        let strikes = std::env::var("VICTORY_LAZY_HOT_STRIKES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .unwrap_or(2)
+            .max(1);
+        let window = std::env::var("VICTORY_LAZY_HOT_WINDOW")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(60)
+            .max(1);
+        (strikes, window)
+    })
+}
+
+#[cfg(test)]
+type PostTransitionHook = Box<dyn FnOnce(usize) + Send>;
+
+#[cfg(test)]
+static TRY_DEFER_POST_TRANSITION_HOOK: Mutex<Option<PostTransitionHook>> = Mutex::new(None);
+
+#[cfg(test)]
+static BACK_READS_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+static LAZY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct LazyTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: u8,
+}
+
+#[cfg(test)]
+pub(crate) fn test_disable_lazy_copyback() -> LazyTestGuard {
+    LazyTestGuard::disable()
+}
+
+#[cfg(test)]
+impl LazyTestGuard {
+    fn enable() -> Self {
+        let lock = LAZY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = LAZY_TEST_OVERRIDE.swap(2, Ordering::AcqRel);
+        Self { _lock: lock, prev }
+    }
+
+    fn disable() -> Self {
+        let lock = LAZY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = LAZY_TEST_OVERRIDE.swap(1, Ordering::AcqRel);
+        Self { _lock: lock, prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for LazyTestGuard {
+    fn drop(&mut self) {
+        LAZY_TEST_OVERRIDE.store(self.prev, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+struct BackReadsTestGuard {
+    prev: u8,
+}
+
+#[cfg(test)]
+impl BackReadsTestGuard {
+    fn enable() -> Self {
+        let prev = BACK_READS_TEST_OVERRIDE.swap(2, Ordering::AcqRel);
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BackReadsTestGuard {
+    fn drop(&mut self) {
+        BACK_READS_TEST_OVERRIDE.store(self.prev, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlushOutcome {
+    /// Page has been flushed/unprotected (`PAGE_READWRITE`) and is accessible.
+    Accessible,
+    /// Arming committed (`PAGE_NOACCESS`): waiting faults must retry lookup.
+    ArmedRetry,
+}
+
+struct FlushWait {
+    state: Mutex<Option<FlushOutcome>>,
+    ready: Condvar,
+}
+
+impl FlushWait {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> FlushOutcome {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(outcome) = *guard {
+                return outcome;
+            }
+            guard = self.ready.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn finish(&self, outcome: FlushOutcome) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(outcome);
+        self.ready.notify_all();
+    }
+}
+
+struct ArmedPage {
+    shadow: Weak<Shadow>,
+    shadow_id: u64,
+    offset: usize,
+    page_idx: usize,
+    /// When the armed page is a single-view `MEM_MAPPED` section (`inplace::Cover::Run`),
+    /// stores `(section_handle, section_offset, section_bytes)` so VEH / flush can
+    /// write all 64 KiB through our persistent writable `inplace::OWN` alias view
+    /// BEFORE flipping the title view from `PAGE_NOACCESS` to `PAGE_READWRITE` —
+    /// zero torn-read window and zero per-page `MapViewOfFile`/`UnmapViewOfFile`.
+    section_view: Option<(usize, u64, u64)>,
+}
+
+enum LazyEntry {
+    Armed(ArmedPage),
+    Busy {
+        shadow_id: u64,
+        wait: Arc<FlushWait>,
+    },
+}
+
+/// Per-page baseline flushed from GPU into title memory, paired with the
+/// unapplied byte intervals inside `[0, PAGE)` so `lazy_apply_flushed_baseline`
+/// applies each byte at most once (idempotent across consecutive relay merges
+/// or overlapping ranges) while keeping `LAZY_RESYNC` active until the next
+/// `Shadow::update` / `Shadow::writing`.
+struct FlushedBaseline {
+    bytes: Vec<u8>,
+    remaining: Vec<(usize, usize)>,
+}
+
+impl FlushedBaseline {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            remaining: vec![(0, PAGE)],
+        }
+    }
+
+    /// Copies any unapplied subranges intersecting `[src_lo, src_hi)` into `dst`
+    /// (where `dst[0]` corresponds to `src_lo`), removing them from `remaining`.
+    /// Returns `true` when every byte in `[0, PAGE)` has been applied.
+    fn apply_once(&mut self, src_lo: usize, src_hi: usize, dst: &mut [u8]) -> bool {
+        let mut next = Vec::with_capacity(self.remaining.len() + 1);
+        for &(r_lo, r_hi) in &self.remaining {
+            if r_hi <= src_lo || r_lo >= src_hi {
+                next.push((r_lo, r_hi));
+                continue;
+            }
+            if r_lo < src_lo {
+                next.push((r_lo, src_lo));
+            }
+            let o_lo = r_lo.max(src_lo);
+            let o_hi = r_hi.min(src_hi);
+            let dst_off = o_lo - src_lo;
+            let n = o_hi - o_lo;
+            dst[dst_off..dst_off + n].copy_from_slice(&self.bytes[o_lo..o_hi]);
+            if r_hi > src_hi {
+                next.push((src_hi, r_hi));
+            }
+        }
+        self.remaining = next;
+        self.remaining.is_empty()
+    }
+}
+
+struct LazyTable {
+    pages: BTreeMap<usize, LazyEntry>,
+    pinned: BTreeSet<usize>,
+    /// Active `watch::title_memory_remapping` / `lazy_flush_and_hold` page
+    /// intervals `(id, first_page, last_page)`.
+    remapping: Vec<(u64, usize, usize)>,
+    next_remap_id: u64,
+    flushed_baselines: BTreeMap<(u64, usize), FlushedBaseline>,
+}
+
+impl LazyTable {
+    const fn new() -> Self {
+        Self {
+            pages: BTreeMap::new(),
+            pinned: BTreeSet::new(),
+            remapping: Vec::new(),
+            next_remap_id: 1,
+            flushed_baselines: BTreeMap::new(),
+        }
+    }
+
+    fn is_remapping(&self, page: usize) -> bool {
+        self.remapping.iter().any(|&(_, lo, hi)| lo <= page && page < hi)
+    }
+}
+
+/// Level 1 metadata table for lazy GPU-resident pages.
+static LAZY_TABLE: Mutex<LazyTable> = Mutex::new(LazyTable::new());
+
+/// Lock-free count of currently armed or busy lazy pages (0 when inactive).
+static LAZY_ARMED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of lock-free hash stripes for O(1) contention-free deferred-page
+/// queries and Dekker-synchronized host access holds.
+const LAZY_STRIPES: usize = 1024;
+const LAZY_STRIPE_MASK: usize = LAZY_STRIPES - 1;
+
+/// Exact count of `LAZY_TABLE.pages` entries hashing to `page & LAZY_STRIPE_MASK`.
+/// Maintained under `LAZY_TABLE` via [`lazy_table_insert_busy`] and
+/// [`lazy_table_remove_page`].
+static LAZY_ARMED_STRIPES: [std::sync::atomic::AtomicU32; LAZY_STRIPES] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; LAZY_STRIPES];
+
+/// Lock-free host access hold counters (per-stripe for ranges `<= 8` pages,
+/// global for larger ranges). Pairs with `LAZY_ARMED_STRIPES` via `SeqCst`
+/// Dekker ordering so `host::read_into`/`copy_mapped`/`write_mapped`/`copy_fill`
+/// never acquire `LAZY_TABLE` on the common non-deferred path while still
+/// strictly blocking concurrent relay `try_defer_piece_relay` arming.
+static LAZY_HOLD_STRIPES: [std::sync::atomic::AtomicU32; LAZY_STRIPES] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; LAZY_STRIPES];
+static LAZY_HOLD_GLOBAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Monotonic count of completed lazy flushes (for stale-fault disambiguation).
+static LAZY_FLUSH_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic counters: `[0]=newly_armed, [1]=steady_state_hits,
+/// [2]=veh_read_faults, [3]=veh_write_faults, [4]=explicit_flushes,
+/// [5]=bytes_flushed`.
+static LAZY_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Additional monotonic diagnostic totals: `[0]=self_bypass_hits,
+/// [1]=materialize_us, [2]=protect_us, [3]=protect_calls`.
+static LAZY_EXTRA_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Nanosecond accumulator so sub-microsecond `VirtualProtect` calls are never
+/// truncated away from `lazy_protect_ms`.
+static LAZY_PROTECT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Per-frame-window counters swapped in [`lazy_line`]:
+/// `[0]=lazy_deferred_pages, [1]=lazy_veh_faults, [2]=lazy_self_bypass_hits,
+/// [3]=lazy_materialize_us, [4]=lazy_protect_us`.
+static LAZY_METER_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn lazy_record_deferred(pages: u64) {
+    if pages == 0 {
+        return;
+    }
+    LAZY_METER_STATS[0].fetch_add(pages, Ordering::Relaxed);
+    crate::framelog::add(crate::framelog::T::LazyDeferredPages, pages);
+}
+
+fn lazy_record_veh_fault(is_write: bool) {
+    LAZY_STATS[if is_write { 3 } else { 2 }].fetch_add(1, Ordering::Relaxed);
+    LAZY_METER_STATS[1].fetch_add(1, Ordering::Relaxed);
+    crate::framelog::add(crate::framelog::T::LazyVehFaults, 1);
+}
+
+fn lazy_record_self_bypass(pages: u64) {
+    if pages == 0 {
+        return;
+    }
+    LAZY_EXTRA_STATS[0].fetch_add(pages, Ordering::Relaxed);
+    LAZY_METER_STATS[2].fetch_add(pages, Ordering::Relaxed);
+    crate::framelog::add(crate::framelog::T::LazySelfBypassHits, pages);
+}
+
+fn lazy_record_materialize_us(us: u64) {
+    if us == 0 {
+        return;
+    }
+    LAZY_EXTRA_STATS[1].fetch_add(us, Ordering::Relaxed);
+    LAZY_METER_STATS[3].fetch_add(us, Ordering::Relaxed);
+    crate::framelog::add(crate::framelog::T::LazyMaterializeUs, us);
+}
+
+/// Unconditionally records one actual `VirtualProtect` syscall and accumulates
+/// its duration in nanoseconds (flushing whole microseconds without sub-us loss).
+pub(crate) fn lazy_record_protect_ns(ns: u64) {
+    LAZY_EXTRA_STATS[3].fetch_add(1, Ordering::Relaxed);
+    let prev = LAZY_PROTECT_NS_TOTAL.fetch_add(ns, Ordering::Relaxed);
+    let us_delta = (prev.saturating_add(ns) / 1_000).saturating_sub(prev / 1_000);
+    if us_delta > 0 {
+        LAZY_EXTRA_STATS[2].fetch_add(us_delta, Ordering::Relaxed);
+        LAZY_METER_STATS[4].fetch_add(us_delta, Ordering::Relaxed);
+        crate::framelog::add(crate::framelog::T::LazyProtectUs, us_delta);
+    }
+}
+
+/// Logs per-frame lazy copy-back diagnostics (`Meter::frame`) whenever
+/// `VICTORY_LAZY_COPYBACK=1` is active or any lazy work occurred in the window.
+pub(crate) fn lazy_line(frames: f64) {
+    let f = frames.max(1.0);
+    let s: [u64; 5] = std::array::from_fn(|i| LAZY_METER_STATS[i].swap(0, Ordering::Relaxed));
+    let resident = LAZY_ARMED_COUNT.load(Ordering::Relaxed);
+    if !lazy_copyback() && resident == 0 && s.iter().all(|&v| v == 0) {
+        return;
+    }
+    tracing::info!(
+        "lazy copy-back per frame: lazy_deferred_pages={:.0}, lazy_veh_faults={:.1}, \
+         lazy_self_bypass_hits={:.1}, lazy_materialize_ms={:.2}, lazy_protect_ms={:.2} \
+         (resident_pages={resident})",
+        s[0] as f64 / f,
+        s[1] as f64 / f,
+        s[2] as f64 / f,
+        s[3] as f64 / 1e3 / f,
+        s[4] as f64 / 1e3 / f,
+    );
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LazyTelemetrySnapshot {
+    deferred_pages: u64,
+    veh_faults: u64,
+    self_bypass_hits: u64,
+    materialize_us: u64,
+    protect_us: u64,
+    protect_calls: u64,
+    bytes_flushed: u64,
+}
+
+#[cfg(test)]
+fn lazy_telemetry_snapshot() -> LazyTelemetrySnapshot {
+    LazyTelemetrySnapshot {
+        deferred_pages: LAZY_STATS[0].load(Ordering::Relaxed) + LAZY_STATS[1].load(Ordering::Relaxed),
+        veh_faults: LAZY_STATS[2].load(Ordering::Relaxed) + LAZY_STATS[3].load(Ordering::Relaxed),
+        self_bypass_hits: LAZY_EXTRA_STATS[0].load(Ordering::Relaxed),
+        materialize_us: LAZY_EXTRA_STATS[1].load(Ordering::Relaxed),
+        protect_us: LAZY_EXTRA_STATS[2].load(Ordering::Relaxed),
+        protect_calls: LAZY_EXTRA_STATS[3].load(Ordering::Relaxed),
+        bytes_flushed: LAZY_STATS[5].load(Ordering::Relaxed),
+    }
+}
+
+/// Monotonic mutation counter incremented under `LAZY_TABLE` on every insert,
+/// transition, or removal in `LAZY_TABLE.pages`. Used by VEH fault handling to
+/// detect concurrent flush/re-arm races without holding `GUARDS` across locks.
+static LAZY_TABLE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn lazy_table_epoch() -> u64 {
+    LAZY_TABLE_EPOCH.load(Ordering::Acquire)
+}
+
+fn lazy_table_insert_busy(table: &mut LazyTable, page: usize, shadow_id: u64, wait: Arc<FlushWait>) {
+    let prev = table.pages.insert(page, LazyEntry::Busy { shadow_id, wait });
+    if prev.is_none() {
+        // Both `LAZY_ARMED_COUNT` and `LAZY_ARMED_STRIPES` use `SeqCst` so the
+        // Dekker pair with `LAZY_HOLD_GLOBAL`/`LAZY_HOLD_STRIPES` (`SeqCst`) is
+        // strictly in the global `SeqCst` total order for all range sizes.
+        LAZY_ARMED_COUNT.fetch_add(1, Ordering::SeqCst);
+        LAZY_ARMED_STRIPES[page & LAZY_STRIPE_MASK].fetch_add(1, Ordering::SeqCst);
+    }
+    LAZY_TABLE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+fn lazy_table_insert_armed(table: &mut LazyTable, page: usize, armed: ArmedPage) {
+    let prev = table.pages.insert(page, LazyEntry::Armed(armed));
+    if prev.is_none() {
+        LAZY_ARMED_COUNT.fetch_add(1, Ordering::SeqCst);
+        LAZY_ARMED_STRIPES[page & LAZY_STRIPE_MASK].fetch_add(1, Ordering::SeqCst);
+    }
+    LAZY_TABLE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+fn lazy_table_remove_page(table: &mut LazyTable, page: usize) -> Option<LazyEntry> {
+    let prev = table.pages.remove(&page);
+    if prev.is_some() {
+        LAZY_ARMED_STRIPES[page & LAZY_STRIPE_MASK].fetch_sub(1, Ordering::Release);
+        LAZY_ARMED_COUNT.fetch_sub(1, Ordering::AcqRel);
+        LAZY_TABLE_EPOCH.fetch_add(1, Ordering::AcqRel);
+    }
+    prev
+}
+
+#[inline]
+fn lazy_is_held(page: usize) -> bool {
+    LAZY_HOLD_GLOBAL.load(Ordering::SeqCst) > 0
+        || LAZY_HOLD_STRIPES[page & LAZY_STRIPE_MASK].load(Ordering::SeqCst) > 0
+}
+
+#[inline]
+fn lazy_range_may_have_armed(first: usize, last: usize) -> bool {
+    if LAZY_ARMED_COUNT.load(Ordering::SeqCst) == 0 || first >= last {
+        return false;
+    }
+    if last - first <= 16 {
+        (first..last).any(|p| LAZY_ARMED_STRIPES[p & LAZY_STRIPE_MASK].load(Ordering::SeqCst) > 0)
+    } else {
+        true
+    }
+}
+
+enum HoldKind {
+    None,
+    Small(usize, usize),
+    Global,
+}
+
+/// Zero-allocation, lock-free host access hold guard preventing concurrent
+/// relay `try_defer_piece_relay` from arming `PAGE_NOACCESS` on pages covered
+/// by `[at, at + len)`.
+pub(crate) struct LazyAccessHold {
+    kind: HoldKind,
+}
+
+impl Drop for LazyAccessHold {
+    fn drop(&mut self) {
+        match self.kind {
+            HoldKind::None => {}
+            HoldKind::Small(first, last) => {
+                for p in first..last {
+                    LAZY_HOLD_STRIPES[p & LAZY_STRIPE_MASK].fetch_sub(1, Ordering::Release);
+                }
+            }
+            HoldKind::Global => {
+                LAZY_HOLD_GLOBAL.fetch_sub(1, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Acquires a lock-free host access hold for `[at, at + len)`. When
+/// `VICTORY_LAZY_COPYBACK` is OFF, executes zero atomics and zero locks.
+pub(crate) fn lazy_hold_access(at: usize, len: usize) -> LazyAccessHold {
+    if len == 0 || !lazy_copyback() {
+        return LazyAccessHold { kind: HoldKind::None };
+    }
+    let first = at / PAGE;
+    let last = at.saturating_add(len).div_ceil(PAGE);
+    if last - first <= 8 {
+        for p in first..last {
+            LAZY_HOLD_STRIPES[p & LAZY_STRIPE_MASK].fetch_add(1, Ordering::SeqCst);
+        }
+        LazyAccessHold {
+            kind: HoldKind::Small(first, last),
+        }
+    } else {
+        LAZY_HOLD_GLOBAL.fetch_add(1, Ordering::SeqCst);
+        LazyAccessHold { kind: HoldKind::Global }
+    }
+}
+
+/// Number of 64 KiB pages (4 MiB) batched per single `LazyReadback` GPU submit.
+const LAZY_READBACK_BATCH_PAGES: usize = 64;
+
+/// Dedicated GPU readback context (Level 2), pre-allocated before any
+/// `PAGE_NOACCESS` page is ever armed so VEH never allocates D3D12 objects.
+///
+/// Uses a dedicated `D3D12_COMMAND_LIST_TYPE_COPY` queue (falling back to
+/// `host.queue` only if the device refuses a copy queue) so on-demand
+/// materialization executes immediately on the hardware copy engine instead of
+/// stalling behind queued render flights on the direct queue, and batches up to
+/// 4 MiB (`LAZY_READBACK_BATCH_PAGES` pages) into a single GPU submit.
+struct LazyReadback {
+    queue: windows::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
+    allocator: windows::Win32::Graphics::Direct3D12::ID3D12CommandAllocator,
+    list: windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+    fence: windows::Win32::Graphics::Direct3D12::ID3D12Fence,
+    event: windows::Win32::Foundation::HANDLE,
+    host_wait_event: windows::Win32::Foundation::HANDLE,
+    fence_value: u64,
+    readback: ID3D12Resource,
+    mapped: *const u8,
+}
+
+// SAFETY: accessed exclusively under `LAZY_GPU` mutex; D3D12 objects are
+// free-threaded and `event`/`host_wait_event` are only waited on under `LAZY_GPU`.
+unsafe impl Send for LazyReadback {}
+
+impl Drop for LazyReadback {
+    fn drop(&mut self) {
+        // SAFETY: `readback` was mapped in `LazyReadback::new` and events are ours.
+        unsafe {
+            self.readback.Unmap(0, None);
+            let _ = windows::Win32::Foundation::CloseHandle(self.event);
+            let _ = windows::Win32::Foundation::CloseHandle(self.host_wait_event);
+        }
+    }
+}
+
+impl LazyReadback {
+    fn new() -> Option<Self> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::System::Threading::CreateEventW;
+
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: (LAZY_READBACK_BATCH_PAGES * PAGE) as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        // SAFETY: plain D3D12 object creation on `host.device`.
+        unsafe {
+            let copy_desc = D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                ..Default::default()
+            };
+            let (queue, list_type) = match host.device.CreateCommandQueue::<ID3D12CommandQueue>(&copy_desc) {
+                Ok(q) => (q, D3D12_COMMAND_LIST_TYPE_COPY),
+                Err(_) => (host.queue.clone(), D3D12_COMMAND_LIST_TYPE_DIRECT),
+            };
+            let allocator: ID3D12CommandAllocator = host.device.CreateCommandAllocator(list_type).ok()?;
+            let list: ID3D12GraphicsCommandList =
+                host.device.CreateCommandList(0, list_type, &allocator, None).ok()?;
+            list.Close().ok()?;
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            let event = CreateEventW(None, false, false, None).ok()?;
+            let host_wait_event = match CreateEventW(None, false, false, None) {
+                Ok(ev) => ev,
+                Err(_) => {
+                    let _ = windows::Win32::Foundation::CloseHandle(event);
+                    return None;
+                }
+            };
+            let mut readback: Option<ID3D12Resource> = None;
+            if host
+                .device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .is_err()
+            {
+                let _ = windows::Win32::Foundation::CloseHandle(event);
+                let _ = windows::Win32::Foundation::CloseHandle(host_wait_event);
+                return None;
+            }
+            let readback = match readback {
+                Some(r) => r,
+                None => {
+                    let _ = windows::Win32::Foundation::CloseHandle(event);
+                    let _ = windows::Win32::Foundation::CloseHandle(host_wait_event);
+                    return None;
+                }
+            };
+            let mut mapped = std::ptr::null_mut();
+            if readback.Map(0, None, Some(&mut mapped)).is_err() {
+                let _ = windows::Win32::Foundation::CloseHandle(event);
+                let _ = windows::Win32::Foundation::CloseHandle(host_wait_event);
+                return None;
+            }
+            crate::host::name(&readback, || "lazy copy-back 4 MiB readback".into());
+            Some(Self {
+                queue,
+                allocator,
+                list,
+                fence,
+                event,
+                host_wait_event,
+                fence_value: 0,
+                readback,
+                mapped: mapped.cast(),
+            })
+        }
+    }
+
+    /// Reads `reqs.len()` 64 KiB pages into `dst` (`dst.len() == reqs.len() * PAGE`),
+    /// strictly synchronized against any in-flight async writes on `host.queue`
+    /// (lock-free via `host.submitted_fence()` + `shadow.last_write_fence` +
+    /// `host.fence.GetCompletedValue()`, never locking `host.submitted`):
+    /// - When `host.fence` has already passed every required write fence: ZERO wait.
+    /// - When a non-carded shadow has an in-flight write on `host.queue`: waits on
+    ///   `host.fence` before CPU-copying `shadow.data`.
+    /// - When a carded shadow has an in-flight write on `host.queue`: issues
+    ///   cross-queue `self.queue.Wait(&host.fence, req_fence)` before
+    ///   `ExecuteCommandLists` so D3D12 multi-engine ordering and Frame N+1 data
+    ///   coherence hold with zero debug layer errors.
+    fn read_pages(&mut self, reqs: &[(&Shadow, usize)], dst: &mut [u8]) -> bool {
+        use windows::Win32::Graphics::Direct3D12::ID3D12CommandList;
+        use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+        use windows::core::Interface;
+
+        if reqs.is_empty() {
+            return true;
+        }
+        if dst.len() != reqs.len() * PAGE {
+            return false;
+        }
+        let Some(host) = host() else {
+            return false;
+        };
+        let latest_host_fence = host.submitted_fence();
+        let mut non_carded_req = 0u64;
+        let mut carded_req = 0u64;
+        let mut carded_indices: Vec<usize> = Vec::new();
+        let mut non_carded_indices: Vec<usize> = Vec::new();
+        for (i, &(shadow, offset)) in reqs.iter().enumerate() {
+            if offset.saturating_add(PAGE) > shadow.len as usize {
+                return false;
+            }
+            let wf = shadow.last_write_fence.load(Ordering::Acquire);
+            let need = if shadow.writes_pending() {
+                wf.max(latest_host_fence)
+            } else {
+                wf
+            };
+            if shadow.card.is_some() {
+                carded_req = carded_req.max(need);
+                carded_indices.push(i);
+            } else {
+                non_carded_req = non_carded_req.max(need);
+                non_carded_indices.push(i);
+            }
+        }
+
+        if !non_carded_indices.is_empty() {
+            // SAFETY: free-threaded query/wait on `host.fence` using our exclusive
+            // `host_wait_event` under `LAZY_GPU`; never locks `host.submitted`.
+            let completed = unsafe { host.fence.GetCompletedValue() };
+            if non_carded_req > completed {
+                let waited = unsafe {
+                    (|| -> windows::core::Result<()> {
+                        host.fence
+                            .SetEventOnCompletion(non_carded_req, self.host_wait_event)?;
+                        WaitForSingleObject(self.host_wait_event, INFINITE);
+                        Ok(())
+                    })()
+                };
+                if waited.is_err() {
+                    return false;
+                }
+            }
+            for i in non_carded_indices {
+                let (shadow, offset) = reqs[i];
+                // SAFETY: `offset + PAGE <= shadow.len` checked above and any
+                // in-flight write on `host.queue` has completed.
+                unsafe {
+                    let dst_ptr = dst.as_mut_ptr().add(i * PAGE);
+                    if shadow.rebar != 0 {
+                        copy_from_wc(shadow.data.add(offset), dst_ptr, PAGE);
+                    } else {
+                        std::ptr::copy_nonoverlapping(shadow.data.add(offset), dst_ptr, PAGE);
+                    }
+                }
+            }
+        }
+        if carded_indices.is_empty() {
+            return true;
+        }
+        let mut waited_cross_queue = false;
+        for chunk in carded_indices.chunks(LAZY_READBACK_BATCH_PAGES) {
+            // SAFETY: exclusive ownership under `LAZY_GPU`; `self.queue.Wait`
+            // strictly orders behind any in-flight `host.queue` write so every
+            // `shadow.buffer` is in `COMMON` before `CopyBufferRegion` promotes it.
+            let ok = unsafe {
+                (|| -> windows::core::Result<()> {
+                    if !waited_cross_queue && carded_req > host.fence.GetCompletedValue() {
+                        self.queue.Wait(&host.fence, carded_req)?;
+                        waited_cross_queue = true;
+                    }
+                    self.allocator.Reset()?;
+                    self.list.Reset(&self.allocator, None)?;
+                    let mut c = 0usize;
+                    while c < chunk.len() {
+                        let (shadow, start_off) = reqs[chunk[c]];
+                        let mut run_pages = 1usize;
+                        while c + run_pages < chunk.len() {
+                            let (next_shadow, next_off) = reqs[chunk[c + run_pages]];
+                            if std::ptr::eq(shadow, next_shadow)
+                                && next_off == start_off + run_pages * PAGE
+                            {
+                                run_pages += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        self.list.CopyBufferRegion(
+                            &self.readback,
+                            (c * PAGE) as u64,
+                            &shadow.buffer,
+                            start_off as u64,
+                            (run_pages * PAGE) as u64,
+                        );
+                        c += run_pages;
+                    }
+                    self.list.Close()?;
+                    let cmd: ID3D12CommandList = self.list.cast()?;
+                    self.queue.ExecuteCommandLists(&[Some(cmd)]);
+                    self.fence_value += 1;
+                    self.queue.Signal(&self.fence, self.fence_value)?;
+                    self.fence.SetEventOnCompletion(self.fence_value, self.event)?;
+                    WaitForSingleObject(self.event, INFINITE);
+                    for (slot, &req_idx) in chunk.iter().enumerate() {
+                        std::ptr::copy_nonoverlapping(
+                            self.mapped.add(slot * PAGE),
+                            dst.as_mut_ptr().add(req_idx * PAGE),
+                            PAGE,
+                        );
+                    }
+                    Ok(())
+                })()
+            };
+            if ok.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn read_page(&mut self, shadow: &Shadow, offset: usize, dst: &mut [u8]) -> bool {
+        self.read_pages(&[(shadow, offset)], dst)
+    }
+}
+
+/// Level 2 GPU readback serializer.
+static LAZY_GPU: Mutex<Option<LazyReadback>> = Mutex::new(None);
+/// Lock-free readiness flag so `ensure_lazy_readback()` never blocks behind an
+/// active GPU readback after one-time initialization.
+static LAZY_GPU_READY: AtomicBool = AtomicBool::new(false);
+
+fn ensure_lazy_readback() -> bool {
+    if LAZY_GPU_READY.load(Ordering::Acquire) {
+        return true;
+    }
+    let mut gpu = LAZY_GPU.lock().unwrap_or_else(|e| e.into_inner());
+    if gpu.is_none() {
+        *gpu = LazyReadback::new();
+    }
+    let ok = gpu.is_some();
+    if ok {
+        LAZY_GPU_READY.store(true, Ordering::Release);
+    }
+    ok
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageAccess {
+    Accessible,
+    NoAccess,
+    Other,
+}
+
+/// Queries the current commit/protection state of `addr` for `READ` vs `WRITE`.
+fn query_page_access(addr: usize, is_write: bool) -> PageAccess {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain struct filled by `VirtualQuery`.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer.
+    let n = unsafe { VirtualQuery(addr as *const _, &mut mbi, size_of_val(&mbi)) };
+    if n == 0 || mbi.State != MEM_COMMIT {
+        return PageAccess::Other;
+    }
+    if mbi.Protect == PAGE_NOACCESS {
+        return PageAccess::NoAccess;
+    }
+    let accessible = if is_write {
+        matches!(mbi.Protect, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
+    } else {
+        matches!(
+            mbi.Protect,
+            PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_READ
+        )
+    };
+    if accessible {
+        PageAccess::Accessible
+    } else {
+        PageAccess::Other
+    }
+}
+
+/// Coalesced `VirtualProtect(..., PAGE_READWRITE)` over a uniform contiguous run
+/// of committed `PAGE_NOACCESS` pages `[run_first, run_last)`. Binary-splits on
+/// VAD/uncommitted boundaries; any single page with split 4 KiB protections is
+/// left `false` in `restored` so callers invoke [`unprotect_and_write_page`].
+fn restore_rw_run(run_first: usize, run_last: usize, restored: &mut [bool], base_first: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect,
+        VirtualQuery,
+    };
+    if run_first >= run_last {
+        return;
+    }
+    let addr = run_first * PAGE;
+    let bytes = (run_last - run_first) * PAGE;
+    // SAFETY: plain struct filled by `VirtualQuery`.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer.
+    let n = unsafe { VirtualQuery(addr as *const _, &mut mbi, size_of_val(&mbi)) };
+    if n != 0
+        && mbi.State == MEM_COMMIT
+        && mbi.Protect == PAGE_NOACCESS
+        && (mbi.BaseAddress as usize) <= addr
+        && (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) >= addr.saturating_add(bytes)
+    {
+        let mut old = 0u32;
+        let t0 = std::time::Instant::now();
+        // SAFETY: verified committed `PAGE_NOACCESS` contiguous run we armed.
+        let ok = unsafe { VirtualProtect(addr as *const _, bytes, PAGE_READWRITE, &mut old) != 0 };
+        lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+        if ok {
+            for p in run_first..run_last {
+                restored[p - base_first] = true;
+            }
+            return;
+        }
+    }
+    if run_last - run_first == 1 {
+        return;
+    }
+    let mid = run_first + (run_last - run_first) / 2;
+    restore_rw_run(run_first, mid, restored, base_first);
+    restore_rw_run(mid, run_last, restored, base_first);
+}
+
+/// Copies `[sub_lo, sub_hi)` ranges inside `[0, PAGE)` outside `[excl_lo, excl_hi)`
+/// from `src` to `dst_base`.
+///
+/// # Safety
+/// `dst_base + sub_lo .. dst_base + sub_hi` must be committed and writable and `src.len() == PAGE`.
+unsafe fn copy_subregion_bytes(
+    dst_base: *mut u8,
+    src: &[u8],
+    sub_lo: usize,
+    sub_hi: usize,
+    excl_lo: usize,
+    excl_hi: usize,
+) {
+    debug_assert_eq!(src.len(), PAGE);
+    if excl_lo >= sub_hi || excl_hi <= sub_lo {
+        // SAFETY: caller guarantees `[sub_lo, sub_hi)` is writable.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(sub_lo), dst_base.add(sub_lo), sub_hi - sub_lo);
+        }
+        return;
+    }
+    if sub_lo < excl_lo {
+        // SAFETY: `[sub_lo, excl_lo)` lies inside `[sub_lo, sub_hi)`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(sub_lo), dst_base.add(sub_lo), excl_lo - sub_lo);
+        }
+    }
+    if excl_hi < sub_hi {
+        // SAFETY: `[excl_hi, sub_hi)` lies inside `[sub_lo, sub_hi)`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(excl_hi), dst_base.add(excl_hi), sub_hi - excl_hi);
+        }
+    }
+}
+
+fn write_section_subregion(
+    section_view: (usize, u64, u64),
+    bytes: &[u8],
+    sub_lo: usize,
+    sub_hi: usize,
+    excl_lo: usize,
+    excl_hi: usize,
+) -> bool {
+    let (section, off, sec_bytes) = section_view;
+    if excl_lo >= sub_hi || excl_hi <= sub_lo {
+        return crate::inplace::write_section_own(
+            section,
+            sec_bytes,
+            off + sub_lo as u64,
+            &bytes[sub_lo..sub_hi],
+        );
+    }
+    let mut ok = true;
+    if sub_lo < excl_lo {
+        ok &= crate::inplace::write_section_own(
+            section,
+            sec_bytes,
+            off + sub_lo as u64,
+            &bytes[sub_lo..excl_lo],
+        );
+    }
+    if ok && excl_hi < sub_hi {
+        ok &= crate::inplace::write_section_own(
+            section,
+            sec_bytes,
+            off + excl_hi as u64,
+            &bytes[excl_hi..sub_hi],
+        );
+    }
+    ok
+}
+
+/// Fallback when OS protections within `[page_addr, page_addr + PAGE)` are split
+/// into smaller VAD sub-regions: restores `PAGE_READWRITE` on every committed
+/// `PAGE_NOACCESS` sub-region and writes allowed bytes outside `[excl_lo, excl_hi)`.
+fn unprotect_split_subregions(
+    page_addr: usize,
+    data: Option<&[u8]>,
+    excl_lo: usize,
+    excl_hi: usize,
+    section_view: Option<(usize, u64, u64)>,
+) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE,
+        VirtualProtect, VirtualQuery,
+    };
+    let page_end = page_addr.saturating_add(PAGE);
+    let mut cursor = page_addr;
+    let mut any_unprotected = false;
+    let mut wrote_any = false;
+    while cursor < page_end {
+        // SAFETY: plain struct filled by `VirtualQuery`.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer.
+        let n = unsafe { VirtualQuery(cursor as *const _, &mut mbi, size_of_val(&mbi)) };
+        if n == 0 {
+            break;
+        }
+        let sub_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize).min(page_end);
+        if sub_end <= cursor {
+            cursor = cursor.saturating_add(4096);
+            continue;
+        }
+        if mbi.State == MEM_COMMIT && mbi.Protect == PAGE_NOACCESS {
+            let sub_lo = cursor - page_addr;
+            let sub_hi = sub_end - page_addr;
+            let prewritten = if let (Some(bytes), Some(sv)) = (data, section_view)
+                && mbi.Type == MEM_MAPPED
+            {
+                let own = write_section_subregion(
+                    sv,
+                    bytes,
+                    sub_lo,
+                    sub_hi,
+                    excl_lo,
+                    excl_hi,
+                );
+                if own {
+                    std::sync::atomic::fence(Ordering::Release);
+                    wrote_any = true;
+                }
+                own
+            } else {
+                false
+            };
+            let mut old = 0u32;
+            let t0 = std::time::Instant::now();
+            // SAFETY: verified committed `PAGE_NOACCESS` sub-region within `[page_addr, page_end)`.
+            let ok = unsafe { VirtualProtect(cursor as *const _, sub_end - cursor, PAGE_READWRITE, &mut old) != 0 };
+            lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+            if ok {
+                any_unprotected = true;
+                if let Some(bytes) = data
+                    && !prewritten
+                {
+                    // SAFETY: `[cursor, sub_end)` is now committed `PAGE_READWRITE`.
+                    unsafe { copy_subregion_bytes(page_addr as *mut u8, bytes, sub_lo, sub_hi, excl_lo, excl_hi) };
+                    wrote_any = true;
+                }
+            }
+        }
+        cursor = sub_end;
+    }
+    if wrote_any {
+        std::sync::atomic::fence(Ordering::Release);
+    }
+    any_unprotected
+}
+
+/// Restores `PAGE_READWRITE` on `[page_addr, page_addr + PAGE)` only if it is
+/// still committed `PAGE_NOACCESS` (handling both uniform 64 KiB regions and
+/// split 4 KiB VAD sub-regions while defending against unnotified decommits),
+/// and writes `data` into every unprotected sub-region.
+fn unprotect_and_write_page(
+    page_addr: usize,
+    data: Option<&[u8]>,
+    section_view: Option<(usize, u64, u64)>,
+) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE,
+        VirtualProtect, VirtualQuery,
+    };
+    // SAFETY: plain struct filled by `VirtualQuery`.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer.
+    let n = unsafe { VirtualQuery(page_addr as *const _, &mut mbi, size_of_val(&mbi)) };
+    if n == 0 {
+        return false;
+    }
+    if mbi.State != MEM_COMMIT
+        || (mbi.BaseAddress as usize) > page_addr
+        || (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) < page_addr.saturating_add(PAGE)
+        || mbi.Protect != PAGE_NOACCESS
+    {
+        return unprotect_split_subregions(page_addr, data, PAGE, PAGE, section_view);
+    }
+    if let (Some(bytes), Some((section, off, sec_bytes))) = (data, section_view)
+        && mbi.Type == MEM_MAPPED
+    {
+        debug_assert_eq!(bytes.len(), PAGE);
+        if crate::inplace::write_section_own(section, sec_bytes, off, bytes) {
+            std::sync::atomic::fence(Ordering::Release);
+            let mut old = 0u32;
+            let t0 = std::time::Instant::now();
+            // SAFETY: atomic PTE flip revealing fully populated physical page.
+            let ok = unsafe { VirtualProtect(page_addr as *const _, PAGE, PAGE_READWRITE, &mut old) != 0 };
+            lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+            return ok;
+        }
+    }
+    let mut old = 0u32;
+    let t0 = std::time::Instant::now();
+    // SAFETY: verified committed `PAGE_NOACCESS` 64 KiB page we armed.
+    let ok = unsafe { VirtualProtect(page_addr as *const _, PAGE, PAGE_READWRITE, &mut old) != 0 };
+    if !ok {
+        lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+        return false;
+    }
+    if let Some(bytes) = data {
+        debug_assert_eq!(bytes.len(), PAGE);
+        // SAFETY: `page_addr` was just verified committed and set `PAGE_READWRITE`
+        // for `PAGE` bytes, and `bytes` is our disjoint heap buffer. Copy
+        // immediately before querying the clock or recording telemetry to keep
+        // the `MEM_PRIVATE` post-`VirtualProtect` window as narrow as possible.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), page_addr as *mut u8, PAGE) };
+        std::sync::atomic::fence(Ordering::Release);
+    }
+    lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+    true
+}
+
+/// Writes GPU bytes ONLY to the unwritten complement `[0..rel_lo)` and
+/// `[rel_hi..PAGE)` of a partially overwritten deferred page `[page_addr, page_addr + PAGE)`
+/// (used by [`lazy_release_written_range`] after DirectStorage writes into
+/// backing physical pages), then restores `PAGE_READWRITE`. Never touches
+/// `[rel_lo..rel_hi)`.
+fn unprotect_and_write_complement(
+    page_addr: usize,
+    gpu_bytes: &[u8],
+    rel_lo: usize,
+    rel_hi: usize,
+    section_view: Option<(usize, u64, u64)>,
+) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE,
+        VirtualProtect, VirtualQuery,
+    };
+    debug_assert_eq!(gpu_bytes.len(), PAGE);
+    debug_assert!(rel_lo <= rel_hi && rel_hi <= PAGE);
+    // SAFETY: plain struct filled by `VirtualQuery`.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer.
+    let n = unsafe { VirtualQuery(page_addr as *const _, &mut mbi, size_of_val(&mbi)) };
+    if n == 0 {
+        return false;
+    }
+    if mbi.State != MEM_COMMIT
+        || (mbi.BaseAddress as usize) > page_addr
+        || (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) < page_addr.saturating_add(PAGE)
+        || mbi.Protect != PAGE_NOACCESS
+    {
+        return unprotect_split_subregions(page_addr, Some(gpu_bytes), rel_lo, rel_hi, section_view);
+    }
+    if let Some((section, off, sec_bytes)) = section_view
+        && mbi.Type == MEM_MAPPED
+    {
+        let mut own_ok = true;
+        if rel_lo > 0 {
+            own_ok &= crate::inplace::write_section_own(section, sec_bytes, off, &gpu_bytes[..rel_lo]);
+        }
+        if own_ok && rel_hi < PAGE {
+            own_ok &= crate::inplace::write_section_own(
+                section,
+                sec_bytes,
+                off + rel_hi as u64,
+                &gpu_bytes[rel_hi..],
+            );
+        }
+        if own_ok {
+            std::sync::atomic::fence(Ordering::Release);
+            let mut old = 0u32;
+            let t0 = std::time::Instant::now();
+            // SAFETY: atomic PTE flip revealing fully coherent page.
+            let ok = unsafe { VirtualProtect(page_addr as *const _, PAGE, PAGE_READWRITE, &mut old) != 0 };
+            lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+            return ok;
+        }
+    }
+    let mut old = 0u32;
+    let t0 = std::time::Instant::now();
+    // SAFETY: verified committed `PAGE_NOACCESS` 64 KiB page we armed.
+    let ok = unsafe { VirtualProtect(page_addr as *const _, PAGE, PAGE_READWRITE, &mut old) != 0 };
+    if !ok {
+        lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+        return false;
+    }
+    // SAFETY: `page_addr` is committed and `PAGE_READWRITE`; copy only complement
+    // immediately before querying the clock or recording telemetry.
+    unsafe {
+        let base = page_addr as *mut u8;
+        if rel_lo > 0 {
+            std::ptr::copy_nonoverlapping(gpu_bytes.as_ptr(), base, rel_lo);
+        }
+        if rel_hi < PAGE {
+            std::ptr::copy_nonoverlapping(gpu_bytes.as_ptr().add(rel_hi), base.add(rel_hi), PAGE - rel_hi);
+        }
+        std::sync::atomic::fence(Ordering::Release);
+    }
+    lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+    true
+}
+
+/// Flushes one 64 KiB page that has already been transitioned to `LazyEntry::Busy`
+/// in `LAZY_TABLE` and `LAZY_FLUSHING` in `shadow.lazy_state`.
+#[allow(clippy::too_many_arguments)]
+fn flush_armed_page(
+    shadow: &Shadow,
+    page: usize,
+    offset: usize,
+    page_idx: usize,
+    section_view: Option<(usize, u64, u64)>,
+    wait: &FlushWait,
+    is_veh: bool,
+    is_write: bool,
+    save_baseline: bool,
+) {
+    // Heap allocation (never 64 KiB on a VEH stack).
+    let mut buf = vec![0u8; PAGE];
+    let t_mat = std::time::Instant::now();
+    let ok = {
+        let mut gpu = LAZY_GPU.lock().unwrap_or_else(|e| e.into_inner());
+        gpu.as_mut().is_some_and(|rb| rb.read_page(shadow, offset, &mut buf))
+    };
+    let wrote = unprotect_and_write_page(page * PAGE, ok.then_some(buf.as_slice()), section_view);
+    lazy_record_materialize_us(t_mat.elapsed().as_micros() as u64);
+    {
+        let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        lazy_table_remove_page(&mut table, page);
+        LAZY_FLUSH_TOTAL.fetch_add(1, Ordering::Release);
+        if save_baseline {
+            if ok && wrote {
+                table
+                    .flushed_baselines
+                    .insert((shadow.id, page_idx), FlushedBaseline::new(buf));
+            }
+            shadow.record_lazy_flush_strike(page_idx);
+            shadow.lazy_state[page_idx].store(LAZY_RESYNC, Ordering::Release);
+            shadow.resync_count.fetch_add(1, Ordering::AcqRel);
+        } else {
+            shadow.lazy_state[page_idx].store(LAZY_EAGER, Ordering::Release);
+        }
+        shadow.deferred_count.fetch_sub(1, Ordering::AcqRel);
+    }
+    if is_veh {
+        lazy_record_veh_fault(is_write);
+    } else {
+        LAZY_STATS[4].fetch_add(1, Ordering::Relaxed);
+    }
+    if ok {
+        LAZY_STATS[5].fetch_add(PAGE as u64, Ordering::Relaxed);
+    }
+    wait.finish(FlushOutcome::Accessible);
+}
+
+struct ClaimedFlushPage<'a> {
+    page: usize,
+    shadow: &'a Shadow,
+    offset: usize,
+    page_idx: usize,
+    section_view: Option<(usize, u64, u64)>,
+    wait: Arc<FlushWait>,
+}
+
+/// Coalesced batch flush of claimed `Busy` pages: ONE `LazyReadback::read_pages`
+/// (up to 4 MiB on the copy queue), persistent `OWN` section writes for
+/// `MEM_MAPPED` pages, ONE `VirtualProtect(..., PAGE_READWRITE)` per contiguous
+/// run, and ONE `LAZY_TABLE` commit lock.
+fn flush_claimed_batch(batch: &[ClaimedFlushPage<'_>], save_baseline: bool) {
+    if batch.is_empty() {
+        return;
+    }
+    let n = batch.len();
+    let mut bufs = vec![0u8; n * PAGE];
+    let t_mat = std::time::Instant::now();
+    let reqs: Vec<(&Shadow, usize)> = batch.iter().map(|c| (c.shadow, c.offset)).collect();
+    let ok = {
+        let mut gpu = LAZY_GPU.lock().unwrap_or_else(|e| e.into_inner());
+        gpu.as_mut().is_some_and(|rb| rb.read_pages(&reqs, &mut bufs))
+    };
+
+    // Pre-write section-backed pages through persistent `inplace::OWN` ONLY
+    // after verifying via region-cached `VirtualQuery` that the VA is still
+    // committed `MEM_MAPPED | PAGE_NOACCESS` (never writing into an unnotified
+    // unmapped/replaced section).
+    let mut prewritten = vec![false; n];
+    if ok {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+        };
+        let mut cached: Option<(usize, usize, u32, u32, u32)> = None;
+        let mut any_prewritten = false;
+        for (i, c) in batch.iter().enumerate() {
+            let Some((section, off, sec_bytes)) = c.section_view else {
+                continue;
+            };
+            let page_addr = c.page * PAGE;
+            let (base_a, end_a, state, ty, prot) = match cached {
+                Some(m) if page_addr >= m.0 && page_addr + PAGE <= m.1 => m,
+                _ => {
+                    // SAFETY: plain struct filled by `VirtualQuery`.
+                    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    // SAFETY: valid out pointer.
+                    let qn = unsafe { VirtualQuery(page_addr as *const _, &mut mbi, size_of_val(&mbi)) };
+                    if qn == 0 {
+                        continue;
+                    }
+                    let m = (
+                        mbi.BaseAddress as usize,
+                        (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize),
+                        mbi.State,
+                        mbi.Type,
+                        mbi.Protect,
+                    );
+                    cached = Some(m);
+                    m
+                }
+            };
+            if state == MEM_COMMIT
+                && ty == MEM_MAPPED
+                && prot == PAGE_NOACCESS
+                && page_addr >= base_a
+                && page_addr + PAGE <= end_a
+                && crate::inplace::write_section_own(
+                    section,
+                    sec_bytes,
+                    off,
+                    &bufs[i * PAGE..(i + 1) * PAGE],
+                )
+            {
+                prewritten[i] = true;
+                any_prewritten = true;
+            }
+        }
+        if any_prewritten {
+            std::sync::atomic::fence(Ordering::Release);
+        }
+    }
+
+    // Coalesce contiguous pages in `batch` (already sorted by `page`) into runs
+    // for `VirtualProtect(..., PAGE_READWRITE)`.
+    let mut restored = vec![false; n];
+    let mut idx = 0usize;
+    while idx < n {
+        let run_start_idx = idx;
+        let run_first = batch[idx].page;
+        let mut run_last = run_first + 1;
+        idx += 1;
+        while idx < n && batch[idx].page == run_last {
+            run_last += 1;
+            idx += 1;
+        }
+        restore_rw_run(run_first, run_last, &mut restored[run_start_idx..idx], run_first);
+    }
+
+    // Copy bytes for uniform restored pages not prewritten via `OWN`, and handle
+    // split-4K / mixed-protection pages via `unprotect_and_write_page`.
+    {
+        let mut copied_any = false;
+        for (i, c) in batch.iter().enumerate() {
+            if restored[i] {
+                if ok && !prewritten[i] {
+                    // SAFETY: `restore_rw_run` verified uniform committed `PAGE_READWRITE`.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bufs.as_ptr().add(i * PAGE),
+                            (c.page * PAGE) as *mut u8,
+                            PAGE,
+                        );
+                    }
+                    copied_any = true;
+                }
+            } else {
+                let data = (ok && !prewritten[i]).then_some(&bufs[i * PAGE..(i + 1) * PAGE]);
+                if unprotect_and_write_page(c.page * PAGE, data, c.section_view) {
+                    restored[i] = true;
+                    copied_any = true;
+                }
+            }
+        }
+        if copied_any {
+            std::sync::atomic::fence(Ordering::Release);
+        }
+    }
+    lazy_record_materialize_us(t_mat.elapsed().as_micros() as u64);
+
+    {
+        let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, c) in batch.iter().enumerate() {
+            lazy_table_remove_page(&mut table, c.page);
+            if save_baseline {
+                if ok && restored[i] {
+                    table.flushed_baselines.insert(
+                        (c.shadow.id, c.page_idx),
+                        FlushedBaseline::new(bufs[i * PAGE..(i + 1) * PAGE].to_vec()),
+                    );
+                }
+                c.shadow.record_lazy_flush_strike(c.page_idx);
+                c.shadow.lazy_state[c.page_idx].store(LAZY_RESYNC, Ordering::Release);
+                c.shadow.resync_count.fetch_add(1, Ordering::AcqRel);
+            } else {
+                c.shadow.lazy_state[c.page_idx].store(LAZY_EAGER, Ordering::Release);
+            }
+            c.shadow.deferred_count.fetch_sub(1, Ordering::AcqRel);
+        }
+        LAZY_FLUSH_TOTAL.fetch_add(n as u64, Ordering::Release);
+    }
+    LAZY_STATS[4].fetch_add(n as u64, Ordering::Relaxed);
+    if ok {
+        LAZY_STATS[5].fetch_add((n * PAGE) as u64, Ordering::Relaxed);
+    }
+    for c in batch {
+        c.wait.finish(FlushOutcome::Accessible);
+    }
+}
+
+/// Permanently pins title pages overlapping `[at, at + len)` (e.g., GPU fence
+/// polling and `defer_write` targets) so they are NEVER protected `PAGE_NOACCESS`.
+/// Any currently deferred page in the range is flushed first.
+pub(crate) fn lazy_pin_range(at: usize, len: usize) {
+    if len == 0 || !lazy_copyback() {
+        return;
+    }
+    let first = at / PAGE;
+    let last = at.saturating_add(len).div_ceil(PAGE);
+    {
+        let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        for page in first..last {
+            table.pinned.insert(page);
+        }
+    }
+    lazy_flush_range(at, len);
+}
+
+/// Whether `page` (`addr / PAGE`) is currently armed or mid-flush in `LAZY_TABLE`.
+/// O(1) lock-free stripe fast path — zero mutex acquisitions when the stripe
+/// has no armed pages.
+pub(crate) fn is_lazy_deferred_page(page: usize) -> bool {
+    if LAZY_ARMED_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    if LAZY_ARMED_STRIPES[page & LAZY_STRIPE_MASK].load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    LAZY_TABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pages
+        .contains_key(&page)
+}
+
+/// Returns all currently armed/busy lazy page numbers in `[first, last)` in
+/// sorted order under AT MOST ONE `LAZY_TABLE` lock (zero locks when
+/// `LAZY_ARMED_COUNT == 0` or small range has empty stripes).
+pub(crate) fn lazy_deferred_pages_in_range(first: usize, last: usize) -> Vec<usize> {
+    if !lazy_range_may_have_armed(first, last) {
+        return Vec::new();
+    }
+    let table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    table.pages.range(first..last).map(|(&p, _)| p).collect()
+}
+
+/// Returns deferred page numbers in `[from, to)` owned by ANY shadow other than
+/// `my_id` without flushing or unprotecting them.
+fn lazy_other_deferred_pages(my_id: u64, from: usize, to: usize) -> Vec<usize> {
+    if from >= to {
+        return Vec::new();
+    }
+    let first = from / PAGE;
+    let last = to.div_ceil(PAGE);
+    if !lazy_range_may_have_armed(first, last) {
+        return Vec::new();
+    }
+    let table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    table
+        .pages
+        .range(first..last)
+        .filter_map(|(&p, entry)| match entry {
+            LazyEntry::Armed(a) if a.shadow_id != my_id => Some(p),
+            LazyEntry::Busy { shadow_id, .. } if *shadow_id != my_id => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Internal layer self-bypass reader: services `[src, src + dst.len())` into
+/// host slice `dst` while caller holds [`LazyAccessHold`].
+/// - Non-deferred ranges take the lock-free zero-mutex fast path directly to
+///   `fallback_read`.
+/// - Any `LAZY_DEFERRED` page in the range is read directly from its owning
+///   shadow (batched on the copy queue for carded VRAM, direct copy for shared/
+///   ReBAR) WITHOUT unprotecting title memory, WITHOUT triggering VEH, and
+///   WITHOUT clearing `LAZY_DEFERRED` or setting `LAZY_RESYNC`!
+pub(crate) fn lazy_read_bypass(
+    src: usize,
+    dst: &mut [u8],
+    mut fallback_read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> bool {
+    let len = dst.len();
+    if len == 0 {
+        return true;
+    }
+    let end = src.saturating_add(len);
+    let first = src / PAGE;
+    let last = end.div_ceil(PAGE);
+    if !lazy_range_may_have_armed(first, last) {
+        return fallback_read(src, dst);
+    }
+
+    // Snapshot all `Armed` pages overlapping `[first, last)`, waiting on any
+    // transiently `Busy` entry. Because the caller holds `LazyAccessHold`, no
+    // new page in `[first, last)` can transition into `LAZY_TABLE` concurrently.
+    let armed: Vec<(usize, Arc<Shadow>, usize)> = loop {
+        enum Snapshot {
+            None,
+            Wait(Arc<FlushWait>),
+            Yield,
+            Pages(Vec<(usize, Arc<Shadow>, usize)>),
+        }
+        let snap = {
+            let table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut found = Vec::new();
+            let mut wait = None;
+            let mut yield_drop = false;
+            for (&page, entry) in table.pages.range(first..last) {
+                match entry {
+                    LazyEntry::Busy { wait: w, .. } => {
+                        wait = Some(w.clone());
+                        break;
+                    }
+                    LazyEntry::Armed(a) => match a.shadow.upgrade() {
+                        Some(shadow) => found.push((page, shadow, a.offset)),
+                        None => {
+                            yield_drop = true;
+                            break;
+                        }
+                    },
+                }
+            }
+            if let Some(w) = wait {
+                Snapshot::Wait(w)
+            } else if yield_drop {
+                Snapshot::Yield
+            } else if found.is_empty() {
+                Snapshot::None
+            } else {
+                Snapshot::Pages(found)
+            }
+        };
+        match snap {
+            Snapshot::None => return fallback_read(src, dst),
+            Snapshot::Wait(w) => {
+                let _ = w.wait();
+            }
+            Snapshot::Yield => std::thread::yield_now(),
+            Snapshot::Pages(pages) => break pages,
+        }
+    };
+
+    // 1. Batch-read all deferred pages directly from their owning shadow(s).
+    let t_mat = std::time::Instant::now();
+    let mut page_bufs = vec![0u8; armed.len() * PAGE];
+    let reqs: Vec<(&Shadow, usize)> = armed.iter().map(|(_, s, off)| (s.as_ref(), *off)).collect();
+    let read_ok = {
+        let mut gpu = LAZY_GPU.lock().unwrap_or_else(|e| e.into_inner());
+        gpu.as_mut().is_some_and(|rb| rb.read_pages(&reqs, &mut page_bufs))
+    };
+    lazy_record_materialize_us(t_mat.elapsed().as_micros() as u64);
+    if !read_ok {
+        // Fallback: explicitly flush and read via normal kernel/plain path.
+        lazy_flush_range(src, len);
+        return fallback_read(src, dst);
+    }
+    lazy_record_self_bypass(armed.len() as u64);
+
+    // 2. Copy deferred page slices into `dst` and service non-deferred gaps via `fallback_read`.
+    let mut cursor = src;
+    for (i, &(page, _, _)) in armed.iter().enumerate() {
+        let p_lo = (page * PAGE).max(src);
+        let p_hi = ((page + 1) * PAGE).min(end);
+        if cursor < p_lo {
+            let run_dst = &mut dst[cursor - src..p_lo - src];
+            if !fallback_read(cursor, run_dst) {
+                return false;
+            }
+        }
+        if p_lo < p_hi {
+            let in_page_lo = p_lo - page * PAGE;
+            let in_page_hi = p_hi - page * PAGE;
+            let page_slice = &page_bufs[i * PAGE + in_page_lo..i * PAGE + in_page_hi];
+            dst[p_lo - src..p_hi - src].copy_from_slice(page_slice);
+        }
+        cursor = p_hi;
+    }
+    cursor >= end || fallback_read(cursor, &mut dst[cursor - src..end - src])
+}
+
+/// Deadlock-free VEH demand-fault handler called from `watch.rs::on_fault` on
+/// both READ and WRITE access violations before `watch` acquires any lock.
+/// Returns `true` iff the fault was handled and execution may resume.
+pub(crate) fn lazy_on_fault(addr: usize, is_write: bool) -> bool {
+    if LAZY_ARMED_COUNT.load(Ordering::Acquire) == 0
+        && LAZY_FLUSH_TOTAL.load(Ordering::Acquire) == 0
+        && LAZY_TABLE_EPOCH.load(Ordering::Acquire) == 0
+    {
+        return false;
+    }
+    if IN_LAZY_VEH.with(Cell::get) {
+        return false;
+    }
+    struct InVehGuard;
+    impl Drop for InVehGuard {
+        fn drop(&mut self) {
+            IN_LAZY_VEH.with(|c| c.set(false));
+        }
+    }
+    IN_LAZY_VEH.with(|c| c.set(true));
+    let _in_veh = InVehGuard;
+
+    let page = addr / PAGE;
+    // Fast lock-free exit when this stripe has no armed pages and the fault is
+    // not a stale post-flush or concurrent-rearm race.
+    let stripe_epoch = LAZY_TABLE_EPOCH.load(Ordering::Acquire);
+    if LAZY_ARMED_STRIPES[page & LAZY_STRIPE_MASK].load(Ordering::Acquire) == 0 {
+        match query_page_access(addr, is_write) {
+            PageAccess::Accessible
+                if LAZY_FLUSH_TOTAL.load(Ordering::Acquire) > 0
+                    || LAZY_TABLE_EPOCH.load(Ordering::Acquire) > 0 =>
+            {
+                return true;
+            }
+            PageAccess::NoAccess if LAZY_TABLE_EPOCH.load(Ordering::Acquire) != stripe_epoch => {}
+            _ => return false,
+        }
+    }
+    loop {
+        let action = {
+            let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            match table.pages.get(&page) {
+                Some(LazyEntry::Busy { wait, .. }) => Ok(Err(wait.clone())),
+                Some(LazyEntry::Armed(armed)) => match armed.shadow.upgrade() {
+                    Some(shadow) => {
+                        let (shadow_id, offset, page_idx, section_view) =
+                            (armed.shadow_id, armed.offset, armed.page_idx, armed.section_view);
+                        let wait = Arc::new(FlushWait::new());
+                        shadow.lazy_state[page_idx].store(LAZY_FLUSHING, Ordering::Release);
+                        lazy_table_insert_busy(&mut table, page, shadow_id, wait.clone());
+                        Ok(Ok((shadow, offset, page_idx, section_view, wait)))
+                    }
+                    // `Shadow::drop` is actively executing and will acquire
+                    // `LAZY_TABLE` momentarily to transition to `Busy` and flush.
+                    None => Err(None),
+                },
+                None => Err(Some(LAZY_TABLE_EPOCH.load(Ordering::Acquire))),
+            }
+        };
+        match action {
+            Ok(Ok((shadow, offset, page_idx, section_view, wait))) => {
+                flush_armed_page(&shadow, page, offset, page_idx, section_view, &wait, true, is_write, true);
+                return true;
+            }
+            Ok(Err(wait)) => {
+                if wait.wait() == FlushOutcome::Accessible {
+                    return true;
+                }
+                continue;
+            }
+            Err(None) => {
+                std::thread::yield_now();
+                continue;
+            }
+            Err(Some(epoch_before)) => match query_page_access(addr, is_write) {
+                PageAccess::Accessible
+                    if LAZY_FLUSH_TOTAL.load(Ordering::Acquire) > 0
+                        || LAZY_TABLE_EPOCH.load(Ordering::Acquire) > 0 =>
+                {
+                    return true;
+                }
+                PageAccess::NoAccess if LAZY_TABLE_EPOCH.load(Ordering::Acquire) != epoch_before => continue,
+                _ => return false,
+            },
+        }
+    }
+}
+
+/// Flushes every deferred GPU-resident page overlapping `[at, at + len)` into
+/// title memory and restores `PAGE_READWRITE` in coalesced batches (up to 4 MiB
+/// per copy-queue submit and ONE `VirtualProtect` per contiguous run), waiting
+/// on any in-flight flush. Safe to call with zero Level 0 locks held.
+pub(crate) fn lazy_flush_range(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let first = at / PAGE;
+    let last = at.saturating_add(len).div_ceil(PAGE);
+    if !lazy_range_may_have_armed(first, last) {
+        return;
+    }
+    loop {
+        let mut claimed: Vec<(usize, Arc<Shadow>, usize, usize, Option<(usize, u64, u64)>, Arc<FlushWait>)> =
+            Vec::new();
+        let mut wait_on: Option<Arc<FlushWait>> = None;
+        let mut yield_drop = false;
+        {
+            let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<usize> = table
+                .pages
+                .range(first..last)
+                .take(LAZY_READBACK_BATCH_PAGES)
+                .map(|(&p, _)| p)
+                .collect();
+            for page in keys {
+                match table.pages.get(&page) {
+                    Some(LazyEntry::Busy { wait, .. }) => {
+                        if claimed.is_empty() {
+                            wait_on = Some(wait.clone());
+                            break;
+                        }
+                    }
+                    Some(LazyEntry::Armed(armed)) => match armed.shadow.upgrade() {
+                        Some(shadow) => {
+                            let (shadow_id, offset, page_idx, section_view) =
+                                (armed.shadow_id, armed.offset, armed.page_idx, armed.section_view);
+                            let wait = Arc::new(FlushWait::new());
+                            shadow.lazy_state[page_idx].store(LAZY_FLUSHING, Ordering::Release);
+                            lazy_table_insert_busy(&mut table, page, shadow_id, wait.clone());
+                            claimed.push((page, shadow, offset, page_idx, section_view, wait));
+                        }
+                        None => {
+                            if claimed.is_empty() {
+                                yield_drop = true;
+                                break;
+                            }
+                        }
+                    },
+                    None => {}
+                }
+            }
+        }
+        if !claimed.is_empty() {
+            let batch: Vec<ClaimedFlushPage<'_>> = claimed
+                .iter()
+                .map(|(page, shadow, offset, page_idx, section_view, wait)| ClaimedFlushPage {
+                    page: *page,
+                    shadow: shadow.as_ref(),
+                    offset: *offset,
+                    page_idx: *page_idx,
+                    section_view: *section_view,
+                    wait: wait.clone(),
+                })
+                .collect();
+            flush_claimed_batch(&batch, true);
+            continue;
+        }
+        if let Some(wait) = wait_on {
+            let _ = wait.wait();
+            continue;
+        }
+        if yield_drop {
+            std::thread::yield_now();
+            continue;
+        }
+        return;
+    }
+}
+
+/// Scoped active-remap guard held inside `watch::Remapping` from entry of
+/// `watch::title_memory_remapping` until `Remapping::drop`: prevents any
+/// concurrent relay/submit thread from re-arming `PAGE_NOACCESS` while views
+/// are being unmapped or replaced.
+pub(crate) struct LazyRemapGuard {
+    id: Option<u64>,
+}
+
+impl Drop for LazyRemapGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            table.remapping.retain(|&(rid, _, _)| rid != id);
+        }
+    }
+}
+
+/// Registers an active remap barrier in `LAZY_TABLE` for the duration of
+/// `watch::title_memory_remapping()` without flushing unrelated deferred pages
+/// (exact remapped ranges are flushed by `watch::title_memory_remapped(at, len)`
+/// and `watch::views_mapped` before unmapping/aliasing).
+/// Safe to call with zero Level 0 locks held.
+pub(crate) fn lazy_begin_remapping_barrier() -> LazyRemapGuard {
+    if !lazy_copyback() {
+        return LazyRemapGuard { id: None };
+    }
+    let last = usize::MAX.div_ceil(PAGE);
+    let id = {
+        let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        let id = table.next_remap_id;
+        table.next_remap_id = table.next_remap_id.wrapping_add(1).max(1);
+        table.remapping.push((id, 0, last));
+        id
+    };
+    LazyRemapGuard { id: Some(id) }
+}
+
+/// Registers a scoped non-arming range barrier for `[at, at + len)` and flushes
+/// any currently armed or in-flight-arming deferred pages in that range before
+/// returning. Used for title-destination writes and explicit tests; host read
+/// paths use lock-free [`lazy_hold_access`] + [`lazy_read_bypass`].
+pub(crate) fn lazy_flush_and_hold(at: usize, len: usize) -> LazyAccessHold {
+    let hold = lazy_hold_access(at, len);
+    if len > 0 && lazy_copyback() {
+        lazy_flush_range(at, len);
+    }
+    hold
+}
+
+/// Releases deferred `PAGE_NOACCESS` pages overlapping `[at, at + len)` AFTER
+/// external/DirectStorage bytes have ALREADY been written directly into the
+/// backing physical pages (`watch::title_memory_written`).
+pub(crate) fn lazy_release_written_range(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let first = at / PAGE;
+    let last = end.div_ceil(PAGE);
+    if !lazy_range_may_have_armed(first, last) {
+        return;
+    }
+    loop {
+        enum Next {
+            Done,
+            Wait(Arc<FlushWait>),
+            Yield,
+            Release(usize, Arc<Shadow>, usize, usize, Option<(usize, u64, u64)>, Arc<FlushWait>),
+        }
+        let next = {
+            let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            let found = table.pages.range(first..last).next().map(|(&p, _)| p);
+            match found {
+                None => Next::Done,
+                Some(page) => match table.pages.get(&page) {
+                    Some(LazyEntry::Busy { wait, .. }) => Next::Wait(wait.clone()),
+                    Some(LazyEntry::Armed(armed)) => match armed.shadow.upgrade() {
+                        Some(shadow) => {
+                            let (shadow_id, offset, page_idx, section_view) =
+                                (armed.shadow_id, armed.offset, armed.page_idx, armed.section_view);
+                            let wait = Arc::new(FlushWait::new());
+                            shadow.lazy_state[page_idx].store(LAZY_FLUSHING, Ordering::Release);
+                            lazy_table_insert_busy(&mut table, page, shadow_id, wait.clone());
+                            Next::Release(page, shadow, offset, page_idx, section_view, wait)
+                        }
+                        None => Next::Yield,
+                    },
+                    None => Next::Done,
+                },
+            }
+        };
+        match next {
+            Next::Done => return,
+            Next::Wait(wait) => {
+                let _ = wait.wait();
+            }
+            Next::Yield => std::thread::yield_now(),
+            Next::Release(page, shadow, offset, page_idx, section_view, wait) => {
+                let page_addr = page * PAGE;
+                let page_end = page_addr.saturating_add(PAGE);
+                let w_lo = at.max(page_addr);
+                let w_hi = end.min(page_end);
+                let full_cover = w_lo == page_addr && w_hi == page_end;
+                let t_mat = std::time::Instant::now();
+                let mut baseline = if full_cover {
+                    let captured = if shadow.writes_pending() {
+                        let mut buf = vec![0u8; PAGE];
+                        let ok = {
+                            let mut gpu = LAZY_GPU.lock().unwrap_or_else(|e| e.into_inner());
+                            gpu.as_mut().is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
+                        };
+                        if ok {
+                            LAZY_STATS[5].fetch_add(PAGE as u64, Ordering::Relaxed);
+                        }
+                        ok.then_some(buf)
+                    } else {
+                        None
+                    };
+                    let _ = unprotect_and_write_page(page_addr, None, None);
+                    captured
+                } else {
+                    let mut buf = vec![0u8; PAGE];
+                    let ok = {
+                        let mut gpu = LAZY_GPU.lock().unwrap_or_else(|e| e.into_inner());
+                        gpu.as_mut().is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
+                    };
+                    let wrote = if ok {
+                        unprotect_and_write_complement(
+                            page_addr,
+                            &buf,
+                            w_lo - page_addr,
+                            w_hi - page_addr,
+                            section_view,
+                        )
+                    } else {
+                        unprotect_and_write_page(page_addr, None, None)
+                    };
+                    if ok {
+                        LAZY_STATS[5].fetch_add(PAGE as u64, Ordering::Relaxed);
+                    }
+                    (ok && wrote).then_some(buf)
+                };
+                if full_cover && baseline.is_none() && shadow.writes_pending() {
+                    let mut buf = vec![0u8; PAGE];
+                    let ok = {
+                        let mut gpu = LAZY_GPU.lock().unwrap_or_else(|e| e.into_inner());
+                        gpu.as_mut().is_some_and(|rb| rb.read_page(&shadow, offset, &mut buf))
+                    };
+                    if ok {
+                        LAZY_STATS[5].fetch_add(PAGE as u64, Ordering::Relaxed);
+                        baseline = Some(buf);
+                    }
+                }
+                lazy_record_materialize_us(t_mat.elapsed().as_micros() as u64);
+                {
+                    let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+                    lazy_table_remove_page(&mut table, page);
+                    LAZY_FLUSH_TOTAL.fetch_add(1, Ordering::Release);
+                    if let Some(buf) = baseline {
+                        table
+                            .flushed_baselines
+                            .insert((shadow.id, page_idx), FlushedBaseline::new(buf));
+                    }
+                    shadow.record_lazy_flush_strike(page_idx);
+                    shadow.lazy_state[page_idx].store(LAZY_RESYNC, Ordering::Release);
+                    shadow.resync_count.fetch_add(1, Ordering::AcqRel);
+                    shadow.deferred_count.fetch_sub(1, Ordering::AcqRel);
+                }
+                LAZY_STATS[4].fetch_add(1, Ordering::Relaxed);
+                wait.finish(FlushOutcome::Accessible);
+            }
+        }
+    }
+}
+
+/// Flushes deferred pages in `[from, to)` owned by ANY shadow other than `my_id`
+/// in coalesced batches (used by `Shadow::writing` when another shadow takes
+/// GPU write ownership of an overlapping address range).
+fn lazy_flush_other_shadows(my_id: u64, from: usize, to: usize) -> Vec<usize> {
+    if from >= to {
+        return Vec::new();
+    }
+    let first = from / PAGE;
+    let last = to.div_ceil(PAGE);
+    if !lazy_range_may_have_armed(first, last) {
+        return Vec::new();
+    }
+    let mut flushed = Vec::new();
+    loop {
+        let mut claimed: Vec<(usize, Arc<Shadow>, usize, usize, Option<(usize, u64, u64)>, Arc<FlushWait>)> =
+            Vec::new();
+        let mut wait_on: Option<(usize, Arc<FlushWait>)> = None;
+        let mut yield_drop = false;
+        {
+            let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<usize> = table
+                .pages
+                .range(first..last)
+                .filter_map(|(&p, entry)| match entry {
+                    LazyEntry::Armed(a) if a.shadow_id != my_id => Some(p),
+                    LazyEntry::Busy { shadow_id, .. } if *shadow_id != my_id => Some(p),
+                    _ => None,
+                })
+                .take(LAZY_READBACK_BATCH_PAGES)
+                .collect();
+            for page in keys {
+                match table.pages.get(&page) {
+                    Some(LazyEntry::Busy { wait, .. }) => {
+                        if claimed.is_empty() {
+                            wait_on = Some((page, wait.clone()));
+                            break;
+                        }
+                    }
+                    Some(LazyEntry::Armed(armed)) => match armed.shadow.upgrade() {
+                        Some(shadow) => {
+                            let (shadow_id, offset, page_idx, section_view) =
+                                (armed.shadow_id, armed.offset, armed.page_idx, armed.section_view);
+                            let wait = Arc::new(FlushWait::new());
+                            shadow.lazy_state[page_idx].store(LAZY_FLUSHING, Ordering::Release);
+                            lazy_table_insert_busy(&mut table, page, shadow_id, wait.clone());
+                            claimed.push((page, shadow, offset, page_idx, section_view, wait));
+                        }
+                        None => {
+                            if claimed.is_empty() {
+                                yield_drop = true;
+                                break;
+                            }
+                        }
+                    },
+                    None => {}
+                }
+            }
+        }
+        if !claimed.is_empty() {
+            let batch: Vec<ClaimedFlushPage<'_>> = claimed
+                .iter()
+                .map(|(page, shadow, offset, page_idx, section_view, wait)| ClaimedFlushPage {
+                    page: *page,
+                    shadow: shadow.as_ref(),
+                    offset: *offset,
+                    page_idx: *page_idx,
+                    section_view: *section_view,
+                    wait: wait.clone(),
+                })
+                .collect();
+            flush_claimed_batch(&batch, true);
+            flushed.extend(claimed.iter().map(|c| c.0));
+            continue;
+        }
+        if let Some((page, wait)) = wait_on {
+            let _ = wait.wait();
+            flushed.push(page);
+            continue;
+        }
+        if yield_drop {
+            std::thread::yield_now();
+            continue;
+        }
+        return flushed;
+    }
+}
+
+/// Drops deferred `PAGE_NOACCESS` protections overlapping `[at, at + len)` before
+/// `VirtualFree` without wasting a GPU readback on memory being freed, restoring
+/// `PAGE_READWRITE` in coalesced contiguous runs and waiting on any in-flight flush.
+pub(crate) fn lazy_release_range(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let first = at / PAGE;
+    let last = at.saturating_add(len).div_ceil(PAGE);
+    if lazy_copyback() || LAZY_ARMED_COUNT.load(Ordering::Acquire) > 0 {
+        let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        if !table.pinned.is_empty() {
+            let stale_pins: Vec<usize> = table.pinned.range(first..last).copied().collect();
+            for p in stale_pins {
+                table.pinned.remove(&p);
+            }
+        }
+    }
+    if !lazy_range_may_have_armed(first, last) {
+        return;
+    }
+    loop {
+        let mut claimed: Vec<(usize, Weak<Shadow>, usize, Arc<FlushWait>)> = Vec::new();
+        let mut wait_on: Option<Arc<FlushWait>> = None;
+        {
+            let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<usize> = table.pages.range(first..last).map(|(&p, _)| p).collect();
+            for page in keys {
+                match table.pages.get(&page) {
+                    Some(LazyEntry::Busy { wait, .. }) => {
+                        if claimed.is_empty() {
+                            wait_on = Some(wait.clone());
+                            break;
+                        }
+                    }
+                    Some(LazyEntry::Armed(armed)) => {
+                        let (shadow, shadow_id, page_idx) =
+                            (armed.shadow.clone(), armed.shadow_id, armed.page_idx);
+                        let wait = Arc::new(FlushWait::new());
+                        if let Some(s) = shadow.upgrade() {
+                            s.lazy_state[page_idx].store(LAZY_FLUSHING, Ordering::Release);
+                        }
+                        lazy_table_insert_busy(&mut table, page, shadow_id, wait.clone());
+                        claimed.push((page, shadow, page_idx, wait));
+                    }
+                    None => {}
+                }
+            }
+        }
+        if !claimed.is_empty() {
+            let n = claimed.len();
+            let mut restored = vec![false; n];
+            let mut idx = 0usize;
+            while idx < n {
+                let run_start = idx;
+                let run_first = claimed[idx].0;
+                let mut run_last = run_first + 1;
+                idx += 1;
+                while idx < n && claimed[idx].0 == run_last {
+                    run_last += 1;
+                    idx += 1;
+                }
+                restore_rw_run(run_first, run_last, &mut restored[run_start..idx], run_first);
+            }
+            for (i, (page, _, _, _)) in claimed.iter().enumerate() {
+                if !restored[i] {
+                    let _ = unprotect_and_write_page(*page * PAGE, None, None);
+                }
+            }
+            {
+                let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+                for (page, shadow, page_idx, _) in &claimed {
+                    lazy_table_remove_page(&mut table, *page);
+                    if let Some(s) = shadow.upgrade() {
+                        s.lazy_state[*page_idx].store(LAZY_EAGER, Ordering::Release);
+                        s.deferred_count.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+                LAZY_FLUSH_TOTAL.fetch_add(n as u64, Ordering::Release);
+            }
+            for (_, _, _, wait) in claimed {
+                wait.finish(FlushOutcome::Accessible);
+            }
+            continue;
+        }
+        if let Some(wait) = wait_on {
+            let _ = wait.wait();
+            continue;
+        }
+        return;
+    }
+}
+
+/// Rolls back contiguous runs of pages that were temporarily set to
+/// `PAGE_NOACCESS` back to `PAGE_READWRITE` with coalesced `VirtualProtect`.
+fn rollback_noaccess_pages_coalesced(pages: &[usize]) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if pages.is_empty() {
+        return;
+    }
+    fn rollback_subrun(from: usize, to: usize) {
+        let count = to - from;
+        if count == 0 {
+            return;
+        }
+        let mut _rev = 0u32;
+        let t0 = std::time::Instant::now();
+        // SAFETY: restoring `PAGE_READWRITE` on pages we just set `PAGE_NOACCESS`.
+        let ok = unsafe {
+            VirtualProtect((from * PAGE) as *const _, count * PAGE, PAGE_READWRITE, &mut _rev) != 0
+        };
+        lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+        if ok {
+            return;
+        }
+        if count == 1 {
+            let _ = unprotect_and_write_page(from * PAGE, None, None);
+            return;
+        }
+        let mid = from + count / 2;
+        rollback_subrun(from, mid);
+        rollback_subrun(mid, to);
+    }
+    let mut i = 0;
+    while i < pages.len() {
+        let run_first = pages[i];
+        let mut run_last = run_first + 1;
+        i += 1;
+        while i < pages.len() && pages[i] == run_last {
+            run_last += 1;
+            i += 1;
+        }
+        rollback_subrun(run_first, run_last);
+    }
+}
+
+/// Coalesced `VirtualProtect(..., PAGE_NOACCESS)` over `[from, to)`: clips each
+/// sub-run to a single uniform `VirtualQuery` region (`MEM_COMMIT && MEM_PRIVATE
+/// && PAGE_READWRITE`) BEFORE calling multi-page `VirtualProtect` so interior
+/// non-matching protections are never clobbered, never overwrites `cur+1..sub_to`
+/// with `old` on unexpected prior protection, and records every syscall.
+fn protect_private_run_noaccess(from: usize, to: usize, protected: &mut Vec<usize>) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE,
+        VirtualProtect, VirtualQuery,
+    };
+    let mut cur = from;
+    while cur < to {
+        let addr = cur * PAGE;
+        // SAFETY: plain struct filled by `VirtualQuery`.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer.
+        let n = unsafe { VirtualQuery(addr as *const _, &mut mbi, size_of_val(&mbi)) };
+        if n == 0 || mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || mbi.Protect != PAGE_READWRITE {
+            let skip_end = if n != 0 {
+                (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) / PAGE
+            } else {
+                cur + 1
+            };
+            cur = skip_end.max(cur + 1);
+            continue;
+        }
+        let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize) / PAGE;
+        let sub_to = to.min(region_end);
+        if sub_to <= cur {
+            cur += 1;
+            continue;
+        }
+        let count = sub_to - cur;
+        let mut old = 0u32;
+        let t0 = std::time::Instant::now();
+        // SAFETY: `VirtualQuery` verified `[cur, sub_to)` is one uniform
+        // committed `MEM_PRIVATE` `PAGE_READWRITE` region.
+        let ok = unsafe {
+            VirtualProtect((cur * PAGE) as *const _, count * PAGE, PAGE_NOACCESS, &mut old) != 0
+        };
+        lazy_record_protect_ns(t0.elapsed().as_nanos() as u64);
+        if ok && old == PAGE_READWRITE {
+            protected.extend(cur..sub_to);
+        } else if ok {
+            let mut _rev = 0u32;
+            let tr = std::time::Instant::now();
+            // SAFETY: restoring page `cur` to its reported prior protection.
+            unsafe { VirtualProtect((cur * PAGE) as *const _, PAGE, old, &mut _rev) };
+            lazy_record_protect_ns(tr.elapsed().as_nanos() as u64);
+            if count > 1 {
+                let tr2 = std::time::Instant::now();
+                // SAFETY: restoring remaining verified `PAGE_READWRITE` pages.
+                unsafe {
+                    VirtualProtect(
+                        ((cur + 1) * PAGE) as *const _,
+                        (count - 1) * PAGE,
+                        PAGE_READWRITE,
+                        &mut _rev,
+                    )
+                };
+                lazy_record_protect_ns(tr2.elapsed().as_nanos() as u64);
+            }
+        }
+        cur = sub_to;
+    }
+}
+
+/// Batch-defers candidate `(shadow, lo, hi)` pieces across one or more shadows
+/// (used by `host::relay_card_back` and `host::card_back`). Groups pieces by
+/// shadow and arms contiguous runs with coalesced `VirtualProtect` syscalls.
+pub(crate) fn try_defer_pieces_batch(
+    pieces: &[(Arc<Shadow>, usize, usize)],
+    fetched_after: Option<u64>,
+) -> Vec<bool> {
+    if pieces.is_empty() || !lazy_copyback() {
+        return vec![false; pieces.len()];
+    }
+    let mut out = vec![false; pieces.len()];
+    let mut by_shadow: Vec<(usize, Arc<Shadow>, Vec<(usize, usize, usize)>)> = Vec::new();
+    for (i, (shadow, lo, hi)) in pieces.iter().enumerate() {
+        let key = Arc::as_ptr(shadow) as usize;
+        if let Some(entry) = by_shadow.iter_mut().find(|e| e.0 == key) {
+            entry.2.push((i, *lo, *hi));
+        } else {
+            by_shadow.push((key, shadow.clone(), vec![(i, *lo, *hi)]));
+        }
+    }
+    for (_, shadow, list) in by_shadow {
+        let offsets: Vec<(usize, usize)> = list.iter().map(|&(_, lo, hi)| (lo, hi)).collect();
+        let res = shadow.try_defer_shadow_pieces(&offsets, fetched_after);
+        for ((orig_idx, _, _), deferred) in list.into_iter().zip(res) {
+            out[orig_idx] = deferred;
+        }
+    }
+    out
+}
+
+impl Shadow {
+    fn lazy_mark_hot(&self, page_idx: usize, cool_until: u32) {
+        if page_idx < self.lazy_cool_until.len() {
+            self.lazy_cool_until[page_idx].fetch_max(cool_until, Ordering::AcqRel);
+            let _ = self.lazy_state[page_idx].compare_exchange(
+                LAZY_EAGER,
+                LAZY_HOT,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn lazy_mark_ineligible(&self, page_idx: usize) {
+        if page_idx < self.lazy_cool_until.len() {
+            self.lazy_cool_until[page_idx].store(u32::MAX, Ordering::Release);
+            let _ = self.lazy_state[page_idx].compare_exchange(
+                LAZY_EAGER,
+                LAZY_INELIGIBLE,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    fn record_lazy_flush_strike(&self, page_idx: usize) {
+        let frame = lazy_current_frame();
+        if frame == 0 || page_idx >= self.lazy_strikes.len() {
+            return;
+        }
+        let (threshold, window) = lazy_hot_params();
+        let prev_flush = self.lazy_last_flush_frame[page_idx].swap(frame, Ordering::Relaxed);
+        let prev_cool = self.lazy_cool_until[page_idx].load(Ordering::Relaxed);
+        let ref_frame = if prev_cool == u32::MAX {
+            prev_flush
+        } else {
+            prev_flush.max(prev_cool)
+        };
+        let prev_strikes = self.lazy_strikes[page_idx].load(Ordering::Relaxed);
+        let strikes = if prev_flush > 0 && frame.saturating_sub(ref_frame) <= window {
+            prev_strikes.saturating_add(1)
+        } else {
+            1
+        };
+        self.lazy_strikes[page_idx].store(strikes, Ordering::Relaxed);
+        if strikes >= threshold {
+            let cool_until = match strikes - threshold {
+                0 => frame.saturating_add(300).min(u32::MAX - 1),
+                1 => frame.saturating_add(1800).min(u32::MAX - 1),
+                _ => u32::MAX,
+            };
+            self.lazy_cool_until[page_idx].store(cool_until, Ordering::Release);
+        } else if prev_cool != u32::MAX && prev_cool <= frame {
+            self.lazy_cool_until[page_idx].store(0, Ordering::Release);
+        }
+    }
+
+    fn lazy_post_resync_state(&self, page_idx: usize, cur_frame: u32) -> u8 {
+        let cool = self.lazy_cool_until[page_idx].load(Ordering::Acquire);
+        if cool == u32::MAX {
+            LAZY_INELIGIBLE
+        } else if cur_frame > 0 && cool > cur_frame {
+            LAZY_HOT
+        } else {
+            LAZY_EAGER
+        }
+    }
+
+    /// Coalesced batch arming for a shadow's GPU-written pieces `offsets` (`(lo, hi)`):
+    /// - O(1) lock-free fast path for already-`LAZY_DEFERRED`, `LAZY_HOT` cooled,
+    ///   and permanently `LAZY_INELIGIBLE` pieces.
+    /// - Amortizes `copied`, `card.dirty`/`card.sent`, `VIEWS`, `JOURNAL`,
+    ///   `GUARDS`, and `LAZY_TABLE` locks from O(N) to O(1).
+    /// - Zero `VirtualQuery` on `MEM_MAPPED` view pages and cached region-level
+    ///   `VirtualQuery` on `MEM_PRIVATE` pages.
+    /// - Coalesces contiguous runs into ONE `VirtualProtect(..., PAGE_NOACCESS)`
+    ///   syscall (one TLB shootdown) per contiguous run.
+    pub(crate) fn try_defer_shadow_pieces(
+        self: &Arc<Self>,
+        offsets: &[(usize, usize)],
+        fetched_after: Option<u64>,
+    ) -> Vec<bool> {
+        use windows_sys::Win32::System::Memory::{
+            GetWriteWatch, MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION,
+            PAGE_READWRITE, VirtualQuery,
+        };
+
+        let mut out = vec![false; offsets.len()];
+        if offsets.is_empty() || !lazy_copyback() || self.place.is_some() {
+            return out;
+        }
+        #[cfg(test)]
+        if !self.lazy_opted_in && std::env::var_os("VICTORY_LAZY_COPYBACK").is_none_or(|v| v != "1") {
+            return out;
+        }
+
+        let start = self.start as usize;
+        let len = self.len as usize;
+        let base = start / PAGE;
+        let watched_ok = self.watched.load(Ordering::Relaxed) == 1;
+        let cur_frame = lazy_current_frame();
+
+        #[derive(Clone, Copy)]
+        struct Cand {
+            out_idx: usize,
+            lo: usize,
+            page: usize,
+            page_idx: usize,
+            copied_at: u64,
+            section_view: Option<(usize, u64, u64)>,
+        }
+
+        let mut steady_hits = 0u64;
+        let mut cands: Vec<Cand> = Vec::new();
+        for (i, &(lo, hi)) in offsets.iter().enumerate() {
+            let page_addr = start.saturating_add(lo);
+            if hi.saturating_sub(lo) != PAGE || !page_addr.is_multiple_of(PAGE) || hi > len {
+                continue;
+            }
+            let page = page_addr / PAGE;
+            let idx = page - base;
+            if idx >= self.lazy_state.len() {
+                continue;
+            }
+            let state = self.lazy_state[idx].load(Ordering::Acquire);
+            if state == LAZY_DEFERRED {
+                out[i] = true;
+                steady_hits += 1;
+                continue;
+            }
+            if state == LAZY_INELIGIBLE || !watched_ok {
+                continue;
+            }
+            if state == LAZY_HOT {
+                let cool = self.lazy_cool_until[idx].load(Ordering::Acquire);
+                if cool == u32::MAX || cur_frame < cool {
+                    continue;
+                }
+                if self.lazy_state[idx]
+                    .compare_exchange(LAZY_HOT, LAZY_EAGER, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+            } else if state != LAZY_EAGER {
+                continue;
+            }
+            cands.push(Cand {
+                out_idx: i,
+                lo,
+                page,
+                page_idx: idx,
+                copied_at: 0,
+                section_view: None,
+            });
+        }
+        if steady_hits > 0 {
+            LAZY_STATS[1].fetch_add(steady_hits, Ordering::Relaxed);
+            lazy_record_deferred(steady_hits);
+        }
+        if cands.is_empty() {
+            return out;
+        }
+
+        // Filter 1: whole-page initialized (`copied_at != 0`) under ONE `self.copied` lock.
+        {
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            cands.retain_mut(|c| {
+                let at = copied.get(c.page_idx).unwrap_or(0);
+                c.copied_at = at;
+                at != 0
+            });
+        }
+        if cands.is_empty() {
+            return out;
+        }
+
+        // Filter 2: no un-uploaded CPU dirty / patched / newer sent bytes under ONE lock.
+        if let Some(card) = &self.card
+            && (card.has_dirty.load(Ordering::Acquire)
+                || card.has_patch.load(Ordering::Acquire)
+                || (fetched_after.is_some() && card.has_sent.load(Ordering::Acquire)))
+        {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
+            let sent = fetched_after.map(|_| card.sent.lock().unwrap_or_else(|e| e.into_inner()));
+            cands.retain(|c| {
+                let (lo, hi) = (c.lo, c.lo + PAGE);
+                if dirty.iter().any(|&(a, b)| a < hi && b > lo) {
+                    return false;
+                }
+                if patch.ranges.iter().any(|&(a, b)| a < hi && b > lo) {
+                    return false;
+                }
+                if let (Some(fa), Some(s)) = (fetched_after, sent.as_deref())
+                    && s.iter().any(|&(a, b, seq)| seq > fa && a < hi && b > lo)
+                {
+                    return false;
+                }
+                true
+            });
+        }
+        if cands.is_empty() {
+            return out;
+        }
+
+        // Filter 3: journal check under ONE `JOURNAL` lock.
+        {
+            let queries: Vec<(usize, u64)> = cands.iter().map(|c| (c.page, c.copied_at)).collect();
+            let written = crate::watch::was_written_since_batch(&queries);
+            let mut k = 0;
+            cands.retain(|_| {
+                let ok = !written[k];
+                k += 1;
+                ok
+            });
+        }
+        if cands.is_empty() {
+            return out;
+        }
+
+        // Install VEH and pre-allocate readback channel ONCE before any `PAGE_NOACCESS`.
+        crate::watch::install_veh();
+        if !ensure_lazy_readback() {
+            return out;
+        }
+
+        // Classify `MEM_MAPPED` (clean `watch`-guarded) vs `MEM_PRIVATE` under
+        // ONE `GUARDS` lock + ONE `VIEWS` lock (zero `VirtualQuery` syscalls for
+        // `MEM_MAPPED` views, whether registered or unregistered, and immediate
+        // rejection of aliased or open-guard `MEM_MAPPED` pages!).
+        let cand_pages: Vec<usize> = cands.iter().map(|c| c.page).collect();
+        let clean_guarded = crate::watch::clean_guarded_mask(&cand_pages);
+        let addrs: Vec<usize> = cands.iter().map(|c| c.page * PAGE).collect();
+        let views_info = crate::inplace::single_view_pages_batch(&addrs);
+        let mut mapped_cands: Vec<Cand> = Vec::new();
+        let mut private_cands: Vec<Cand> = Vec::new();
+        for ((mut c, is_clean_guarded), vinfo) in cands
+            .into_iter()
+            .zip(clean_guarded)
+            .zip(views_info)
+        {
+            if is_clean_guarded {
+                match vinfo {
+                    crate::inplace::PageViewInfo::Aliased => {
+                        if cur_frame > 0 {
+                            self.lazy_mark_hot(c.page_idx, cur_frame.saturating_add(120).min(u32::MAX - 1));
+                        }
+                    }
+                    crate::inplace::PageViewInfo::Single(s, o, len) => {
+                        c.section_view = Some((s, o, len));
+                        mapped_cands.push(c);
+                    }
+                    crate::inplace::PageViewInfo::Unknown => {
+                        c.section_view = None;
+                        mapped_cands.push(c);
+                    }
+                }
+            } else {
+                match vinfo {
+                    crate::inplace::PageViewInfo::Unknown => private_cands.push(c),
+                    crate::inplace::PageViewInfo::Aliased => {
+                        if cur_frame > 0 {
+                            self.lazy_mark_hot(c.page_idx, cur_frame.saturating_add(120).min(u32::MAX - 1));
+                        }
+                    }
+                    crate::inplace::PageViewInfo::Single(..) => {}
+                }
+            }
+        }
+
+        mapped_cands.sort_unstable_by_key(|c| c.page);
+        private_cands.sort_unstable_by_key(|c| c.page);
+        // Preserve duplicate `out_idx` entries for identical pages so all
+        // duplicate offsets receive `out[idx] = true` if their page arms.
+        let mut dup_out: Vec<(usize, usize)> = Vec::new();
+        let dedup_preserve = |v: &mut Vec<Cand>, dups: &mut Vec<(usize, usize)>| {
+            let mut w = 0usize;
+            for r in 0..v.len() {
+                if w > 0 && v[w - 1].page == v[r].page {
+                    dups.push((v[r].page, v[r].out_idx));
+                } else {
+                    if w != r {
+                        v.swap(w, r);
+                    }
+                    w += 1;
+                }
+            }
+            v.truncate(w);
+        };
+        dedup_preserve(&mut mapped_cands, &mut dup_out);
+        dedup_preserve(&mut private_cands, &mut dup_out);
+
+        let mut newly_armed = 0u64;
+        let mut armed_pages_set: BTreeSet<usize> = BTreeSet::new();
+
+        // ---- Path A: `MEM_MAPPED` single-view clean `watch`-guarded runs ----
+        if !mapped_cands.is_empty() {
+            let mut reserved: Vec<(Cand, Arc<FlushWait>)> = Vec::with_capacity(mapped_cands.len());
+            let mut pinned_rejects: Vec<usize> = Vec::new();
+            {
+                let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+                for c in mapped_cands {
+                    if table.pinned.contains(&c.page) {
+                        pinned_rejects.push(c.page_idx);
+                        continue;
+                    }
+                    if table.is_remapping(c.page) || table.pages.contains_key(&c.page) {
+                        continue;
+                    }
+                    let wait = Arc::new(FlushWait::new());
+                    lazy_table_insert_busy(&mut table, c.page, self.id, wait.clone());
+                    if lazy_is_held(c.page) {
+                        lazy_table_remove_page(&mut table, c.page);
+                        continue;
+                    }
+                    reserved.push((c, wait));
+                }
+            }
+            for page_idx in pinned_rejects {
+                self.lazy_mark_ineligible(page_idx);
+            }
+            if !reserved.is_empty() {
+                let mut transitioned_set: BTreeSet<usize> = BTreeSet::new();
+                let mut i = 0;
+                while i < reserved.len() {
+                    let run_first = reserved[i].0.page;
+                    let mut run_last = run_first + 1;
+                    i += 1;
+                    while i < reserved.len() && reserved[i].0.page == run_last {
+                        run_last += 1;
+                        i += 1;
+                    }
+                    let ok_blocks = crate::watch::transition_clean_guards_run_to_noaccess(run_first, run_last);
+                    transitioned_set.extend(ok_blocks);
+                }
+
+                #[cfg(test)]
+                if !transitioned_set.is_empty()
+                    && let Some(hook) = TRY_DEFER_POST_TRANSITION_HOOK
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    && let Some(&first_page) = transitioned_set.iter().next()
+                {
+                    hook(first_page);
+                }
+
+                let transitioned_indices: Vec<usize> = reserved
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (c, _))| transitioned_set.contains(&c.page))
+                    .map(|(idx, _)| idx)
+                    .collect();
+                let post_queries: Vec<(usize, u64)> = transitioned_indices
+                    .iter()
+                    .map(|&idx| (reserved[idx].0.page, reserved[idx].0.copied_at))
+                    .collect();
+                let post_written = if post_queries.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::watch::was_written_since_batch(&post_queries)
+                };
+                let mut surviving = vec![false; reserved.len()];
+                for (&r_idx, &w) in transitioned_indices.iter().zip(post_written.iter()) {
+                    if !w {
+                        surviving[r_idx] = true;
+                    }
+                }
+
+                let mut to_rollback_vp: Vec<usize> = Vec::new();
+                let mut to_remove: Vec<(usize, Arc<FlushWait>)> = Vec::new();
+                let mut committed_waits: Vec<Arc<FlushWait>> = Vec::new();
+                {
+                    let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+                    for (r_idx, (c, wait)) in reserved.into_iter().enumerate() {
+                        if surviving[r_idx]
+                            && !table.pinned.contains(&c.page)
+                            && !table.is_remapping(c.page)
+                            && !lazy_is_held(c.page)
+                        {
+                            lazy_table_insert_armed(
+                                &mut table,
+                                c.page,
+                                ArmedPage {
+                                    shadow: Arc::downgrade(self),
+                                    shadow_id: self.id,
+                                    offset: c.lo,
+                                    page_idx: c.page_idx,
+                                    section_view: c.section_view,
+                                },
+                            );
+                            self.lazy_state[c.page_idx].store(LAZY_DEFERRED, Ordering::Release);
+                            self.deferred_count.fetch_add(1, Ordering::AcqRel);
+                            out[c.out_idx] = true;
+                            if !dup_out.is_empty() {
+                                armed_pages_set.insert(c.page);
+                            }
+                            newly_armed += 1;
+                            committed_waits.push(wait);
+                        } else {
+                            if table.pinned.contains(&c.page) {
+                                self.lazy_mark_ineligible(c.page_idx);
+                            }
+                            if transitioned_set.contains(&c.page) {
+                                to_rollback_vp.push(c.page);
+                            }
+                            to_remove.push((c.page, wait));
+                        }
+                    }
+                }
+                if !to_rollback_vp.is_empty() {
+                    rollback_noaccess_pages_coalesced(&to_rollback_vp);
+                }
+                if !to_remove.is_empty() {
+                    let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+                    for &(page, _) in &to_remove {
+                        lazy_table_remove_page(&mut table, page);
+                    }
+                    drop(table);
+                    for (_, wait) in to_remove {
+                        wait.finish(FlushOutcome::Accessible);
+                    }
+                }
+                for wait in committed_waits {
+                    wait.finish(FlushOutcome::ArmedRetry);
+                }
+            }
+        }
+
+        // ---- Path B: `MEM_PRIVATE | MEM_WRITE_WATCH` runs (cached `VirtualQuery`) ----
+        if !private_cands.is_empty() {
+            let mut cached: Option<(usize, usize, u32, u32, u32)> = None;
+            private_cands.retain(|c| {
+                let page_addr = c.page * PAGE;
+                let (base_a, end_a, state, ty, prot) = match cached {
+                    Some(m) if page_addr >= m.0 && page_addr + PAGE <= m.1 => m,
+                    _ => {
+                        // SAFETY: plain struct filled by `VirtualQuery`.
+                        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                        // SAFETY: valid out pointer.
+                        let n = unsafe { VirtualQuery(page_addr as *const _, &mut mbi, size_of_val(&mbi)) };
+                        if n == 0 {
+                            return false;
+                        }
+                        let m = (
+                            mbi.BaseAddress as usize,
+                            (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize),
+                            mbi.State,
+                            mbi.Type,
+                            mbi.Protect,
+                        );
+                        cached = Some(m);
+                        m
+                    }
+                };
+                if state != MEM_COMMIT || page_addr < base_a || page_addr + PAGE > end_a {
+                    return false;
+                }
+                if ty != MEM_PRIVATE {
+                    if ty != MEM_MAPPED {
+                        self.lazy_mark_ineligible(c.page_idx);
+                    }
+                    return false;
+                }
+                prot == PAGE_READWRITE
+            });
+
+            if !private_cands.is_empty() {
+                let mut reserved: Vec<(Cand, Arc<FlushWait>)> = Vec::with_capacity(private_cands.len());
+                let mut pinned_rejects: Vec<usize> = Vec::new();
+                {
+                    let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+                    for c in private_cands {
+                        if table.pinned.contains(&c.page) {
+                            pinned_rejects.push(c.page_idx);
+                            continue;
+                        }
+                        if table.is_remapping(c.page) || table.pages.contains_key(&c.page) {
+                            continue;
+                        }
+                        let wait = Arc::new(FlushWait::new());
+                        lazy_table_insert_busy(&mut table, c.page, self.id, wait.clone());
+                        if lazy_is_held(c.page) {
+                            lazy_table_remove_page(&mut table, c.page);
+                            continue;
+                        }
+                        reserved.push((c, wait));
+                    }
+                }
+                for page_idx in pinned_rejects {
+                    self.lazy_mark_ineligible(page_idx);
+                }
+
+                if !reserved.is_empty() {
+                    let mut protected_set: BTreeSet<usize> = BTreeSet::new();
+                    let mut ww_clean_set: BTreeSet<usize> = BTreeSet::new();
+                    let mut ww_failed_set: BTreeSet<usize> = BTreeSet::new();
+                    let mut touched_buf: Vec<usize> = Vec::new();
+                    let mut i = 0;
+                    while i < reserved.len() {
+                        let run_first = reserved[i].0.page;
+                        let mut run_last = run_first + 1;
+                        i += 1;
+                        while i < reserved.len() && reserved[i].0.page == run_last {
+                            run_last += 1;
+                            i += 1;
+                        }
+                        let mut run_prot: Vec<usize> = Vec::with_capacity(run_last - run_first);
+                        protect_private_run_noaccess(run_first, run_last, &mut run_prot);
+                        if run_prot.is_empty() {
+                            continue;
+                        }
+                        protected_set.extend(run_prot.iter().copied());
+
+                        let mut j = 0;
+                        while j < run_prot.len() {
+                            let sub_first = run_prot[j];
+                            let mut sub_last = sub_first + 1;
+                            j += 1;
+                            while j < run_prot.len() && run_prot[j] == sub_last {
+                                sub_last += 1;
+                                j += 1;
+                            }
+                            let sub_pages = sub_last - sub_first;
+                            let need = sub_pages * (PAGE / 4096);
+                            if touched_buf.len() < need {
+                                touched_buf.resize(need, 0);
+                            }
+                            let mut count = need;
+                            let mut granularity = 0u32;
+                            // SAFETY: non-resetting write-watch query over the contiguous run.
+                            let ww_ok = unsafe {
+                                GetWriteWatch(
+                                    0,
+                                    (sub_first * PAGE) as *const _,
+                                    sub_pages * PAGE,
+                                    touched_buf.as_mut_ptr().cast(),
+                                    &mut count,
+                                    &mut granularity,
+                                ) == 0
+                            };
+                            if !ww_ok {
+                                if sub_pages == 1 {
+                                    ww_failed_set.insert(sub_first);
+                                } else {
+                                    // Probe individually so one non-`MEM_WRITE_WATCH` page does
+                                    // not mask clean `MEM_WRITE_WATCH` neighbors.
+                                    for p in sub_first..sub_last {
+                                        let mut p_cnt = PAGE / 4096;
+                                        let mut p_gran = 0u32;
+                                        // SAFETY: single-page non-resetting `GetWriteWatch`.
+                                        let p_ok = unsafe {
+                                            GetWriteWatch(
+                                                0,
+                                                (p * PAGE) as *const _,
+                                                PAGE,
+                                                touched_buf.as_mut_ptr().cast(),
+                                                &mut p_cnt,
+                                                &mut p_gran,
+                                            ) == 0
+                                        };
+                                        if !p_ok {
+                                            ww_failed_set.insert(p);
+                                        } else if p_cnt == 0 {
+                                            ww_clean_set.insert(p);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            if count == 0 {
+                                ww_clean_set.extend(sub_first..sub_last);
+                            } else {
+                                let mut dirty_pages: BTreeSet<usize> = BTreeSet::new();
+                                for &addr in &touched_buf[..count] {
+                                    dirty_pages.insert(addr / PAGE);
+                                }
+                                for p in sub_first..sub_last {
+                                    if !dirty_pages.contains(&p) {
+                                        ww_clean_set.insert(p);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let clean_indices: Vec<usize> = reserved
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (c, _))| ww_clean_set.contains(&c.page))
+                        .map(|(idx, _)| idx)
+                        .collect();
+                    let post_queries: Vec<(usize, u64)> = clean_indices
+                        .iter()
+                        .map(|&idx| (reserved[idx].0.page, reserved[idx].0.copied_at))
+                        .collect();
+                    let post_written = if post_queries.is_empty() {
+                        Vec::new()
+                    } else {
+                        crate::watch::was_written_since_batch(&post_queries)
+                    };
+                    let mut surviving = vec![false; reserved.len()];
+                    for (&r_idx, &w) in clean_indices.iter().zip(post_written.iter()) {
+                        if !w {
+                            surviving[r_idx] = true;
+                        }
+                    }
+
+                    let mut to_rollback_vp: Vec<usize> = Vec::new();
+                    let mut to_remove: Vec<(usize, Arc<FlushWait>)> = Vec::new();
+                    let mut committed_waits: Vec<Arc<FlushWait>> = Vec::new();
+                    {
+                        let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+                        for (r_idx, (c, wait)) in reserved.into_iter().enumerate() {
+                            if surviving[r_idx]
+                                && !table.pinned.contains(&c.page)
+                                && !table.is_remapping(c.page)
+                                && !lazy_is_held(c.page)
+                            {
+                                lazy_table_insert_armed(
+                                    &mut table,
+                                    c.page,
+                                    ArmedPage {
+                                        shadow: Arc::downgrade(self),
+                                        shadow_id: self.id,
+                                        offset: c.lo,
+                                        page_idx: c.page_idx,
+                                        section_view: None,
+                                    },
+                                );
+                                self.lazy_state[c.page_idx].store(LAZY_DEFERRED, Ordering::Release);
+                                self.deferred_count.fetch_add(1, Ordering::AcqRel);
+                                out[c.out_idx] = true;
+                                if !dup_out.is_empty() {
+                                    armed_pages_set.insert(c.page);
+                                }
+                                newly_armed += 1;
+                                committed_waits.push(wait);
+                            } else {
+                                if ww_failed_set.contains(&c.page) || table.pinned.contains(&c.page) {
+                                    self.lazy_mark_ineligible(c.page_idx);
+                                }
+                                if protected_set.contains(&c.page) {
+                                    to_rollback_vp.push(c.page);
+                                }
+                                to_remove.push((c.page, wait));
+                            }
+                        }
+                    }
+                    if !to_rollback_vp.is_empty() {
+                        rollback_noaccess_pages_coalesced(&to_rollback_vp);
+                    }
+                    if !to_remove.is_empty() {
+                        let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+                        for &(page, _) in &to_remove {
+                            lazy_table_remove_page(&mut table, page);
+                        }
+                        drop(table);
+                        for (_, wait) in to_remove {
+                            wait.finish(FlushOutcome::Accessible);
+                        }
+                    }
+                    for wait in committed_waits {
+                        wait.finish(FlushOutcome::ArmedRetry);
+                    }
+                }
+            }
+        }
+
+        if !dup_out.is_empty() {
+            for (page, extra_idx) in dup_out {
+                if armed_pages_set.contains(&page) {
+                    out[extra_idx] = true;
+                }
+            }
+        }
+        if newly_armed > 0 {
+            LAZY_STATS[0].fetch_add(newly_armed, Ordering::Relaxed);
+            lazy_record_deferred(newly_armed);
+        }
+        out
+    }
+
+    /// Single-piece wrapper around [`Self::try_defer_shadow_pieces`].
+    pub(crate) fn try_defer_piece(self: &Arc<Self>, lo: usize, hi: usize) -> bool {
+        self.try_defer_shadow_pieces(&[(lo, hi)], None)[0]
+    }
+
+    /// Relay variant of [`Self::try_defer_piece`]: also refuses to defer any
+    /// newly-armed piece that has pending/later CPU uploads (`dirty` / `sent`).
+    #[cfg(test)]
+    pub(crate) fn try_defer_piece_relay(self: &Arc<Self>, lo: usize, hi: usize, fetched_after: u64) -> bool {
+        self.try_defer_shadow_pieces(&[(lo, hi)], Some(fetched_after))[0]
+    }
+
+    /// Applies any unapplied bytes of a VEH-flushed 64 KiB baseline into `dst`
+    /// (covering shadow offsets `[at, at + dst.len())`) before eager 3-way merge
+    /// so CPU writes made after a mid-flight VEH flush are never overwritten by
+    /// stale pre-GPU staging/snapshot bytes. Consumes applied byte subranges so
+    /// back-to-back merges (`card_merge_relay` / `relay_merge`) are idempotent
+    /// and never rewind `self.data`/`before` to an older baseline.
+    fn lazy_apply_flushed_baseline(&self, at: usize, dst: &mut [u8]) {
+        if dst.is_empty() {
+            return;
+        }
+        let start = self.start as usize;
+        let base = start / PAGE;
+        let first = (start + at) / PAGE;
+        let last = (start + at + dst.len()).div_ceil(PAGE);
+        let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        for page in first..last {
+            let idx = page - base;
+            if idx >= self.lazy_state.len() || self.lazy_state[idx].load(Ordering::Acquire) != LAZY_RESYNC {
+                continue;
+            }
+            let page_addr = page * PAGE;
+            let lo = page_addr.max(start + at);
+            let hi = (page_addr + PAGE).min(start + at + dst.len());
+            if lo >= hi {
+                continue;
+            }
+            let src_lo = lo - page_addr;
+            let src_hi = hi - page_addr;
+            let dst_off = lo - (start + at);
+            let n = hi - lo;
+            let remove = if let Some(baseline) = table.flushed_baselines.get_mut(&(self.id, idx)) {
+                baseline.apply_once(src_lo, src_hi, &mut dst[dst_off..dst_off + n])
+            } else {
+                false
+            };
+            if remove {
+                table.flushed_baselines.remove(&(self.id, idx));
+            }
+        }
+    }
+
+    /// Copies specific flushed pages from title memory into this shadow (used by
+    /// [`Shadow::writing`] after [`lazy_flush_other_shadows`] materializes another
+    /// overlapping shadow's deferred pages), skipping any page intersecting
+    /// `skip_busy` (`self.pending`).
+    fn resync_pages_from_title(&self, pages: &[usize], skip_busy: &[(usize, usize)]) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let watched = self.watched.load(Ordering::Relaxed) == 1;
+        for &page in pages {
+            if page < base {
+                continue;
+            }
+            let idx = page - base;
+            if idx >= self.lazy_state.len() {
+                continue;
+            }
+            let page_lo = page * PAGE;
+            let page_hi = page_lo.saturating_add(PAGE);
+            if skip_busy.iter().any(|&(ba, be)| ba < page_hi && be > page_lo) {
+                continue;
+            }
+            let p_lo = page_lo.max(start);
+            let p_hi = page_hi.min(end);
+            if p_lo >= p_hi {
+                continue;
+            }
+            let whole = p_lo == page_lo && p_hi == page_hi;
+            let now = if watched {
+                crate::watch::writes(p_lo, p_hi, true).map_or(0, |(now, _)| now)
+            } else {
+                0
+            };
+            self.copy(p_lo, p_hi);
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            copied.set(idx, if whole { now } else { 0 });
+        }
+    }
+
+    /// Transitions `LAZY_RESYNC` pages in `[from, to)` back to `LAZY_EAGER` /
+    /// `LAZY_HOT` / `LAZY_INELIGIBLE` (skipping any page overlapping `skip_busy`)
+    /// and clears their `copied` entry so [`Shadow::update_free`] copies fresh
+    /// title memory (including any CPU writes made after VEH flush) into staging
+    /// and schedules VRAM upload (`card_changed`).
+    fn lazy_prepare_update(&self, from: usize, to: usize, skip_busy: &[(usize, usize)]) {
+        if self.resync_count.load(Ordering::Acquire) == 0 || from >= to {
+            return;
+        }
+        let base = self.start as usize / PAGE;
+        let first = from / PAGE;
+        let last = to.div_ceil(PAGE);
+        let cur_frame = lazy_current_frame();
+        let mut resynced = Vec::new();
+        for page in first..last {
+            let page_lo = page * PAGE;
+            let page_hi = page_lo.saturating_add(PAGE);
+            if skip_busy.iter().any(|&(ba, be)| ba < page_hi && be > page_lo) {
+                continue;
+            }
+            let idx = page - base;
+            if idx < self.lazy_state.len() && self.lazy_state[idx].load(Ordering::Acquire) == LAZY_RESYNC {
+                let next_state = self.lazy_post_resync_state(idx, cur_frame);
+                if self.lazy_state[idx]
+                    .compare_exchange(LAZY_RESYNC, next_state, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    self.resync_count.fetch_sub(1, Ordering::AcqRel);
+                    resynced.push(idx);
+                }
+            }
+        }
+        if resynced.is_empty() {
+            return;
+        }
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for &idx in &resynced {
+                copied.set(idx, 0);
+            }
+        }
+        let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        for idx in resynced {
+            table.flushed_baselines.remove(&(self.id, idx));
+        }
+    }
+
+    /// Resyncs `LAZY_RESYNC` pages in `[from, to)` (skipping any page
+    /// overlapping `skip_busy`) directly from title memory into `self.data`
+    /// (and queues `card_changed`) before a UAV-only submission declared via
+    /// [`Shadow::writing`] runs without a preceding `refresh`.
+    fn lazy_resync_range(&self, from: usize, to: usize, skip_busy: &[(usize, usize)]) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return;
+        }
+        let base = start / PAGE;
+        let first = from / PAGE;
+        let last = to.div_ceil(PAGE);
+        let cur_frame = lazy_current_frame();
+        let mut pages = Vec::new();
+        for page in first..last {
+            let page_lo = page * PAGE;
+            let page_hi = page_lo.saturating_add(PAGE);
+            if skip_busy.iter().any(|&(ba, be)| ba < page_hi && be > page_lo) {
+                continue;
+            }
+            let idx = page - base;
+            if idx < self.lazy_state.len() && self.lazy_state[idx].load(Ordering::Acquire) == LAZY_RESYNC {
+                let next_state = self.lazy_post_resync_state(idx, cur_frame);
+                if self.lazy_state[idx]
+                    .compare_exchange(LAZY_RESYNC, next_state, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    self.resync_count.fetch_sub(1, Ordering::AcqRel);
+                    pages.push((page, idx));
+                }
+            }
+        }
+        if pages.is_empty() {
+            return;
+        }
+        {
+            let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            for &(_, idx) in &pages {
+                table.flushed_baselines.remove(&(self.id, idx));
+            }
+        }
+        let watched = self.watched.load(Ordering::Relaxed) == 1;
+        for (page, idx) in pages {
+            let p_lo = (page * PAGE).max(start);
+            let p_hi = ((page + 1) * PAGE).min(end);
+            if p_lo >= p_hi {
+                continue;
+            }
+            let whole = p_lo == page * PAGE && p_hi == (page + 1) * PAGE;
+            let now = if watched {
+                crate::watch::writes(p_lo, p_hi, true).map_or(0, |(now, _)| now)
+            } else {
+                u64::from(whole)
+            };
+            self.copy(p_lo, p_hi);
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            copied.set(idx, if whole { now } else { 0 });
+        }
+    }
+
+    /// Unwatched copy of `[from, to)` that skips `LAZY_DEFERRED` / `LAZY_FLUSHING`
+    /// pages so GPU-resident pages are never spuriously flushed or overwritten.
+    fn copy_unwatched_skipping_deferred(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        let base = start / PAGE;
+        let first = from / PAGE;
+        let last = to.div_ceil(PAGE);
+        let mut bytes = 0;
+        let mut seg_start: Option<usize> = None;
+        for page in first..last {
+            let idx = page - base;
+            let skip = idx < self.lazy_state.len() && is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire));
+            let p_lo = (page * PAGE).max(from);
+            let p_hi = ((page + 1) * PAGE).min(to);
+            if skip {
+                if let Some(s) = seg_start.take() {
+                    bytes += self.copy(s, p_lo);
+                }
+            } else {
+                seg_start.get_or_insert(p_lo);
+                if page + 1 == last
+                    && let Some(s) = seg_start.take()
+                {
+                    bytes += self.copy(s, p_hi);
+                }
+            }
+        }
+        bytes
+    }
+
+    /// Flushes every deferred page owned by this `Shadow` in coalesced batches.
+    /// Pass `save_baseline = true` from `unregister` (where in-flight lists may
+    /// still hold `Arc<Shadow>` and settle via `card_merge_relay`), or `false`
+    /// from `Drop::drop` (which also removes any remaining `flushed_baselines`).
+    fn lazy_flush_all(&self, save_baseline: bool) {
+        let first = self.start as usize / PAGE;
+        let last = (self.start.saturating_add(self.len) as usize).div_ceil(PAGE);
+        if lazy_range_may_have_armed(first, last) {
+            loop {
+                let mut claimed: Vec<(usize, usize, usize, Option<(usize, u64, u64)>, Arc<FlushWait>)> =
+                    Vec::new();
+                let mut wait_on: Option<Arc<FlushWait>> = None;
+                {
+                    let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+                    let keys: Vec<usize> = table
+                        .pages
+                        .range(first..last)
+                        .filter_map(|(&page, entry)| match entry {
+                            LazyEntry::Armed(a) if a.shadow_id == self.id => Some(page),
+                            LazyEntry::Busy { shadow_id, .. } if *shadow_id == self.id => Some(page),
+                            _ => None,
+                        })
+                        .take(LAZY_READBACK_BATCH_PAGES)
+                        .collect();
+                    for page in keys {
+                        match table.pages.get(&page) {
+                            Some(LazyEntry::Busy { wait, .. }) => {
+                                if claimed.is_empty() {
+                                    wait_on = Some(wait.clone());
+                                    break;
+                                }
+                            }
+                            Some(LazyEntry::Armed(armed)) => {
+                                let (offset, page_idx, section_view) =
+                                    (armed.offset, armed.page_idx, armed.section_view);
+                                let wait = Arc::new(FlushWait::new());
+                                self.lazy_state[page_idx].store(LAZY_FLUSHING, Ordering::Release);
+                                lazy_table_insert_busy(&mut table, page, self.id, wait.clone());
+                                claimed.push((page, offset, page_idx, section_view, wait));
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                if !claimed.is_empty() {
+                    let batch: Vec<ClaimedFlushPage<'_>> = claimed
+                        .iter()
+                        .map(|(page, offset, page_idx, section_view, wait)| ClaimedFlushPage {
+                            page: *page,
+                            shadow: self,
+                            offset: *offset,
+                            page_idx: *page_idx,
+                            section_view: *section_view,
+                            wait: wait.clone(),
+                        })
+                        .collect();
+                    flush_claimed_batch(&batch, save_baseline);
+                    continue;
+                }
+                if let Some(wait) = wait_on {
+                    let _ = wait.wait();
+                    continue;
+                }
+                break;
+            }
+        }
+        if !save_baseline {
+            let mut table = LAZY_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+            table.flushed_baselines.retain(|&(sid, _), _| sid != self.id);
+        }
+    }
+
+    /// Flushes every deferred page owned by this `Shadow` and removes all of its
+    /// `flushed_baselines` during `Drop::drop` without relying on `Weak::upgrade()`.
+    fn lazy_flush_all_on_drop(&mut self) {
+        self.lazy_flush_all(false);
+    }
+}
+
+#[cfg(test)]
+#[path = "shadow_lazy_tests.rs"]
+mod lazy_and_simd_tests;

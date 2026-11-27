@@ -182,6 +182,17 @@ pub enum T {
     /// committing and unmapping them.
     DiskViews,
     DiskViewUs,
+    /// Lazy GPU-resident copy-back (`VICTORY_LAZY_COPYBACK=1`) per-frame
+    /// telemetry: pages deferred (newly armed + steady-state hits), VEH demand
+    /// faults materialized, internal layer read pages serviced via self-bypass
+    /// without unprotecting/faulting, materialization time (GPU readback +
+    /// copy, microseconds), and `VirtualProtect` arming/unprotecting time
+    /// (microseconds).
+    LazyDeferredPages,
+    LazyVehFaults,
+    LazySelfBypassHits,
+    LazyMaterializeUs,
+    LazyProtectUs,
     Count,
 }
 
@@ -486,7 +497,7 @@ fn text(f: &Frame) -> String {
     let ms = |x: T| f.t[x as usize] / 1e3;
     let s = |i: usize| f.s[i];
     let h = |x: H| f.h[x as usize];
-    let line = format!(
+    let mut line = format!(
         "{:.0} ms | render thread: ran {:.0} ms (user {:.0}, kernel {:.0}); in the present call {:.1} (lines and settling \
          {:.1}, copy and show {:.1}), in submit calls {:.1}, in list calls {:.1}, paced {:.1} | submit thread: at work \
          {:.1} ms (user {:.1}, kernel {:.1}); {:.0} submissions, preparing {:.1}, waiting for the card {:.1}; copies {:.1} \
@@ -563,7 +574,25 @@ fn text(f: &Frame) -> String {
         t(T::RecordSlow),
         t(T::RecordLooks),
     );
-    line + &remap_meter(f)
+    line.push_str(&remap_meter(f));
+    if t(T::LazyDeferredPages) > 0.0
+        || t(T::LazyVehFaults) > 0.0
+        || t(T::LazySelfBypassHits) > 0.0
+        || t(T::LazyMaterializeUs) > 0.0
+        || t(T::LazyProtectUs) > 0.0
+    {
+        use std::fmt::Write;
+        let _ = write!(
+            line,
+            " | lazy: lazy_deferred_pages={:.0}, lazy_veh_faults={:.1}, lazy_self_bypass_hits={:.1}, lazy_materialize_ms={:.2}, lazy_protect_ms={:.2}",
+            t(T::LazyDeferredPages),
+            t(T::LazyVehFaults),
+            t(T::LazySelfBypassHits),
+            ms(T::LazyMaterializeUs),
+            ms(T::LazyProtectUs),
+        );
+    }
+    line
 }
 
 /// The remapping meter's part of a frame's line (the totals are described
@@ -832,5 +861,23 @@ mod tests {
         here(H::PaceUs, 5);
         here(H::PaceUs, 6);
         assert_eq!(HERE.with(|c| c.get())[H::PaceUs as usize], 11);
+    }
+
+    #[test]
+    fn lazy_copyback_telemetry_fields_render_only_when_active() {
+        let plain = frame(1, 100.0);
+        assert!(!text(&plain).contains("lazy_deferred_pages"));
+        let mut active = frame(2, 100.0);
+        active.t[T::LazyDeferredPages as usize] = 512.0;
+        active.t[T::LazyVehFaults as usize] = 3.0;
+        active.t[T::LazySelfBypassHits as usize] = 42.0;
+        active.t[T::LazyMaterializeUs as usize] = 1_250.0;
+        active.t[T::LazyProtectUs as usize] = 340.0;
+        let rendered = text(&active);
+        assert!(rendered.contains("lazy_deferred_pages=512"), "{rendered}");
+        assert!(rendered.contains("lazy_veh_faults=3.0"), "{rendered}");
+        assert!(rendered.contains("lazy_self_bypass_hits=42.0"), "{rendered}");
+        assert!(rendered.contains("lazy_materialize_ms=1.25"), "{rendered}");
+        assert!(rendered.contains("lazy_protect_ms=0.34"), "{rendered}");
     }
 }
