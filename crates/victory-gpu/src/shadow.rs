@@ -157,8 +157,9 @@ impl CopiedPages {
 
     /// Plans the coalesced byte ranges `[run_from, run_to)` inside `[from, to)`
     /// that must be copied from title memory, updating whole-page copied
-    /// timestamps to `now`. Runs purely on metadata so callers can release the
-    /// `copied` mutex before invoking memory copies.
+    /// timestamps to `now`. Callers keep `self.copied` held until the planned
+    /// copies complete so concurrent refreshes cannot observe stamped pages before
+    /// their bytes land.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn plan_stale(
@@ -1650,33 +1651,22 @@ pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Ve
 /// ([`card_dirty`]); with [`relay`] they are noted as sent, and the notes of
 /// sends that every fetch still to be merged came after (`fetched`) go.
 fn take_dirty(c: &Card, fetched: u64, sent_as: u64) -> Vec<(usize, usize)> {
-    let relay_on = relay();
-    let has_dirty = c.has_dirty.load(Ordering::Acquire);
-    let has_sent = relay_on && c.has_sent.load(Ordering::Acquire);
-    if !has_dirty && !has_sent {
+    if !c.has_dirty.load(Ordering::Acquire) {
         return Vec::new();
     }
-    if has_dirty {
-        let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        let ranges = std::mem::take(&mut *dirty);
-        if relay_on {
-            let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-            sent.retain(|s| s.2 > fetched);
-            sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-            // Publish `has_sent` BEFORE clearing `has_dirty` so a concurrent
-            // `card_merge_relay` checking `has_dirty` then `has_sent` never
-            // observes both false while a range is transitioning.
-            c.has_sent.store(!sent.is_empty(), Ordering::Release);
-        }
-        c.has_dirty.store(false, Ordering::Release);
-        ranges
-    } else {
-        // Only pruning stale `sent` entries (respects `dirty` -> `sent` lock order).
+    let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+    let ranges = std::mem::take(&mut *dirty);
+    if relay() {
         let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
         sent.retain(|s| s.2 > fetched);
+        sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+        // Publish `has_sent` BEFORE clearing `has_dirty` so a concurrent
+        // `card_merge_relay` checking `has_dirty` then `has_sent` never
+        // observes both false while a range is transitioning.
         c.has_sent.store(!sent.is_empty(), Ordering::Release);
-        Vec::new()
     }
+    c.has_dirty.store(false, Ordering::Release);
+    ranges
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -6242,8 +6232,8 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer. Plans coalesced runs under
-    /// `self.copied`, then releases the mutex before executing the copies.
+    /// asking), whole pages within the buffer. Keeps `self.copied` locked
+    /// until the planned copies finish.
     ///
     /// `subs` ([`crate::watch::subpages`], `VICTORY_DIRTY_4K`): for a page the kernel's write watch found written,
     /// the 4 KiB pages its last asking found and the asking before that which found the page written. A copy that
@@ -6255,20 +6245,19 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let has_deferred = self.deferred_count.load(Ordering::Acquire) > 0;
-        let runs = {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if has_deferred {
-                copied.plan_stale_with_subs(base, start, end, from, to, now, written, subs, narrow, count_dirty4k, |idx| {
-                    is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
-                })
-            } else {
-                copied.plan_stale_with_subs(base, start, end, from, to, now, written, subs, narrow, count_dirty4k, |_| false)
-            }
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let runs = if has_deferred {
+            copied.plan_stale_with_subs(base, start, end, from, to, now, written, subs, narrow, count_dirty4k, |idx| {
+                is_lazy_held(self.lazy_state[idx].load(Ordering::Acquire))
+            })
+        } else {
+            copied.plan_stale_with_subs(base, start, end, from, to, now, written, subs, narrow, count_dirty4k, |_| false)
         };
         let mut bytes = 0;
         for (run_from, run_to) in runs.iter() {
             bytes += self.copy(run_from, run_to);
         }
+        drop(copied);
         bytes
     }
 
